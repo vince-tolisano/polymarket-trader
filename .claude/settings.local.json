@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:crates.io)",
+      "Bash(cargo check *)",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:github.com)",
+      "Bash(curl -s \"https://api.github.com/repos/Polymarket/rs-clob-client-v2/git/trees/main?recursive=1\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/Polymarket/rs-clob-client-v2/main/src/clob/types/mod.rs\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/Polymarket/rs-clob-client-v2/main/src/gamma/client.rs\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/Polymarket/rs-clob-client-v2/main/src/gamma/mod.rs\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/Polymarket/rs-clob-client-v2/main/Cargo.toml\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/Polymarket/rs-clob-client-v2/main/src/gamma/types/request.rs\")"
+    ]
+  }
+}
