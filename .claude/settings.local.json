@@ -11,7 +11,10 @@
       "Bash(curl -s \"https://raw.githubusercontent.com/Polymarket/rs-clob-client-v2/main/src/gamma/client.rs\")",
       "Bash(curl -s \"https://raw.githubusercontent.com/Polymarket/rs-clob-client-v2/main/src/gamma/mod.rs\")",
       "Bash(curl -s \"https://raw.githubusercontent.com/Polymarket/rs-clob-client-v2/main/Cargo.toml\")",
-      "Bash(curl -s \"https://raw.githubusercontent.com/Polymarket/rs-clob-client-v2/main/src/gamma/types/request.rs\")"
+      "Bash(curl -s \"https://raw.githubusercontent.com/Polymarket/rs-clob-client-v2/main/src/gamma/types/request.rs\")",
+      "Bash(cargo metadata *)",
+      "Bash(python -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\([p['manifest_path'] for p in d['packages'] if p['name']=='polymarket_client_sdk_v2'][0]\\)\")",
+      "Bash(cargo search *)"
     ]
   }
 }

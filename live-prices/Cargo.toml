@@ -1,0 +1,12 @@
+[package]
+name = "live-prices"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+polymarket-core = { path = "../core" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+futures = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }

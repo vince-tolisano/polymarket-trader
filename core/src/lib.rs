@@ -8,7 +8,20 @@ use polymarket_client_sdk_v2::gamma::Client as GammaClient;
 use polymarket_client_sdk_v2::gamma::types::request::MarketBySlugRequest;
 
 pub use alloy_primitives::U256;
+pub use polymarket_client_sdk_v2::clob::ws::Client as WsClient;
+pub use polymarket_client_sdk_v2::clob::ws::types::response::{
+    BookUpdate, LastTradePrice, OrderBookLevel, PriceChange, PriceChangeBatchEntry,
+};
 pub use rust_decimal::Decimal;
+
+pub mod event;
+pub mod feed;
+
+pub use event::{
+    CoinbaseEvent, CoinbasePayload, EventClock, FeedSource, PolymarketEvent,
+    PolymarketPayload, RecordedEvent, TradeSide,
+};
+pub use feed::{CoinbaseFeed, PolymarketFeed};
 
 const CLOB_HOST: &str = "https://clob.polymarket.com";
 
