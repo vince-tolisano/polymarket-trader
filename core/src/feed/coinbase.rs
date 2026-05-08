@@ -12,7 +12,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::Decimal;
 use crate::event::{
-    CoinbaseEvent, CoinbasePayload, EventClock, FeedSource, RecordedEvent, TradeSide,
+    CexEvent, CexPayload, CexVenue, EventClock, FeedSource, RecordedEvent, TradeSide,
 };
 
 const WS_URL: &str = "wss://advanced-trade-ws.coinbase.com";
@@ -170,15 +170,16 @@ fn parse_frame(product_id: &str, text: &str) -> Result<Vec<RecordedEvent>> {
                     if t.product_id != product_id {
                         continue;
                     }
-                    let payload = CoinbasePayload::Ticker {
-                        best_bid: Decimal::from_str(&t.best_bid)?,
-                        best_bid_qty: Decimal::from_str(&t.best_bid_quantity)?,
-                        best_ask: Decimal::from_str(&t.best_ask)?,
-                        best_ask_qty: Decimal::from_str(&t.best_ask_quantity)?,
+                    let payload = CexPayload::Ticker {
+                        best_bid: Some(Decimal::from_str(&t.best_bid)?),
+                        best_bid_qty: Some(Decimal::from_str(&t.best_bid_quantity)?),
+                        best_ask: Some(Decimal::from_str(&t.best_ask)?),
+                        best_ask_qty: Some(Decimal::from_str(&t.best_ask_quantity)?),
                         last: Decimal::from_str(&t.price)?,
                     };
-                    out.push(RecordedEvent::Coinbase(Arc::new(CoinbaseEvent {
+                    out.push(RecordedEvent::Cex(Arc::new(CexEvent {
                         clock: EventClock::now(None),
+                        venue: CexVenue::Coinbase,
                         product_id: t.product_id,
                         payload,
                     })));
@@ -200,14 +201,15 @@ fn parse_frame(product_id: &str, text: &str) -> Result<Vec<RecordedEvent>> {
                     } else {
                         TradeSide::Sell
                     };
-                    let payload = CoinbasePayload::Trade {
+                    let payload = CexPayload::Trade {
                         price: Decimal::from_str(&t.price)?,
                         size: Decimal::from_str(&t.size)?,
                         side,
-                        trade_id: t.trade_id,
+                        trade_id: Some(t.trade_id),
                     };
-                    out.push(RecordedEvent::Coinbase(Arc::new(CoinbaseEvent {
+                    out.push(RecordedEvent::Cex(Arc::new(CexEvent {
                         clock: EventClock::now(None),
+                        venue: CexVenue::Coinbase,
                         product_id: t.product_id,
                         payload,
                     })));

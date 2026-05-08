@@ -14,7 +14,23 @@
       "Bash(curl -s \"https://raw.githubusercontent.com/Polymarket/rs-clob-client-v2/main/src/gamma/types/request.rs\")",
       "Bash(cargo metadata *)",
       "Bash(python -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\([p['manifest_path'] for p in d['packages'] if p['name']=='polymarket_client_sdk_v2'][0]\\)\")",
-      "Bash(cargo search *)"
+      "Bash(cargo search *)",
+      "Bash(awk '{print $1 - \\($1 % 300\\)}')",
+      "Bash(curl -s \"https://gamma-api.polymarket.com/markets/slug/btc-updown-5m-1777837800\")",
+      "Bash(python -c \"import sys, json; d=json.load\\(sys.stdin\\); print\\('slug:', d.get\\('slug'\\)\\); print\\('question:', d.get\\('question'\\)\\); print\\('condition_id:', d.get\\('conditionId'\\)\\); print\\('active:', d.get\\('active'\\), 'closed:', d.get\\('closed'\\)\\); print\\('endDate:', d.get\\('endDate'\\)\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import sys, json; d=json.load\\(sys.stdin\\); print\\(d['description']\\)\")",
+      "WebSearch",
+      "WebFetch(domain:docs.chain.link)",
+      "Bash(curl *)",
+      "Bash(grep -oE '\\(referencePrice|startPrice|reference_price|chainlink|\"price\"[^,]*|target\\)[^,}]{0,80}')",
+      "Bash(grep -oE '\\(__NEXT_DATA__|self\\\\.__next_f|/api/|gamma-api|clob|prices-history|timeseries\\)[^\"]{0,80}')",
+      "Bash(grep -oE '\"underlying[^\"]*\"|chart[A-Z][^\"]{0,40}|\"chart[A-Za-z]*\"|\"start[A-Z][a-z]*\"')",
+      "Bash(cargo build *)",
+      "Bash(python *)",
+      "Read(//c/Users/vinni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/reqwest-0.12.28/**)",
+      "Bash(awk '/^\\\\[\\\\[package\\\\]\\\\]/{p=NR}/^name = \"reqwest\"/&&/0\\\\.13/{print \"block start:\", p; flag=1; next}flag && /^\\\\[\\\\[package\\\\]\\\\]/{exit}flag' C:/Users/vinni/RustroverProjects/polymarket-trader/Cargo.lock)",
+      "Bash(awk '{printf \"%d\\\\n\", $1 - \\($1 % 300\\)}')"
     ]
   }
 }

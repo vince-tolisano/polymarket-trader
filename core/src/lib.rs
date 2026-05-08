@@ -1,4 +1,7 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use anyhow::{Context, Result, anyhow};
+use serde::Deserialize;
 use polymarket_client_sdk_v2::clob::types::Side;
 use polymarket_client_sdk_v2::clob::types::request::{
     LastTradePriceRequest, MidpointRequest, PriceRequest,
@@ -18,16 +21,39 @@ pub mod event;
 pub mod feed;
 
 pub use event::{
-    CoinbaseEvent, CoinbasePayload, EventClock, FeedSource, PolymarketEvent,
+    CexEvent, CexPayload, CexVenue, EventClock, FeedSource, PolymarketEvent,
     PolymarketPayload, RecordedEvent, TradeSide,
 };
-pub use feed::{CoinbaseFeed, PolymarketFeed};
+pub use feed::{BitstampFeed, CoinbaseFeed, KrakenFeed, PolymarketFeed};
 
 const CLOB_HOST: &str = "https://clob.polymarket.com";
+const BTC_UPDOWN_5M_WINDOW_SECS: u64 = 300;
+const PYTH_HERMES_HOST: &str = "https://hermes.pyth.network";
+// BTC/USD feed id (Pyth crypto aggregator). 32-byte hex, no 0x prefix.
+const PYTH_BTC_USD_FEED_ID: &str =
+    "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43";
 
 pub struct Polymarket {
     clob: ClobClient,
     gamma: GammaClient,
+    pm_proxy: reqwest::Client,
+}
+
+#[derive(Deserialize)]
+struct PythUpdates {
+    #[serde(default)]
+    parsed: Vec<PythParsed>,
+}
+
+#[derive(Deserialize)]
+struct PythParsed {
+    price: PythPrice,
+}
+
+#[derive(Deserialize)]
+struct PythPrice {
+    price: String,
+    expo: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -53,7 +79,11 @@ impl Polymarket {
         let clob =
             ClobClient::new(CLOB_HOST, Config::default()).context("creating clob client")?;
         let gamma = GammaClient::default();
-        Ok(Self { clob, gamma })
+        let pm_proxy = reqwest::Client::builder()
+            .user_agent("polymarket-trader/0.1")
+            .build()
+            .context("building polymarket frontend client")?;
+        Ok(Self { clob, gamma, pm_proxy })
     }
 
     pub async fn resolve_condition_id(&self, arg: &str) -> Result<String> {
@@ -69,6 +99,76 @@ impl Polymarket {
         let cid = market
             .condition_id
             .ok_or_else(|| anyhow!("market {arg} has no condition_id"))?;
+        Ok(cid.to_string())
+    }
+
+    /// Returns the BTC reference price for the currently-open 5-min up/down
+    /// window, by querying Pyth Network's BTC/USD aggregate at the window's
+    /// start timestamp. Pyth is highly correlated with Chainlink Data Streams
+    /// (both aggregate CEX feeds) and is publicly accessible without auth.
+    /// Returns Ok(None) only if Pyth has no update for that timestamp.
+    pub async fn current_btc_updown_5m_target(&self) -> Result<Option<Decimal>> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system time before unix epoch")?
+            .as_secs();
+        let window_start = now - (now % BTC_UPDOWN_5M_WINDOW_SECS);
+        self.pyth_btc_usd_at(window_start).await
+    }
+
+    /// Fetch Pyth Network's BTC/USD aggregate price at a specific unix
+    /// timestamp (seconds). Hermes returns the update closest to the requested
+    /// time. Returns Ok(None) if no parsed update was returned.
+    pub async fn pyth_btc_usd_at(&self, ts: u64) -> Result<Option<Decimal>> {
+        let url = format!(
+            "{PYTH_HERMES_HOST}/v2/updates/price/{ts}?ids[]={PYTH_BTC_USD_FEED_ID}"
+        );
+        let updates: PythUpdates = self
+            .pm_proxy
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?
+            .error_for_status()
+            .with_context(|| format!("status from {url}"))?
+            .json()
+            .await
+            .context("decoding pyth updates")?;
+
+        let Some(parsed) = updates.parsed.into_iter().next() else {
+            return Ok(None);
+        };
+        let raw: i64 = parsed
+            .price
+            .price
+            .parse()
+            .with_context(|| format!("parsing pyth raw price {:?}", parsed.price.price))?;
+        let expo = parsed.price.expo;
+        // Pyth's expo is typically negative; the actual price = raw * 10^expo.
+        let value = if expo <= 0 {
+            Decimal::new(raw, (-expo) as u32)
+        } else {
+            Decimal::from(raw) * Decimal::from(10_i64.pow(expo as u32))
+        };
+        Ok(Some(value))
+    }
+
+    pub async fn current_btc_updown_5m_condition_id(&self) -> Result<String> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system time before unix epoch")?
+            .as_secs();
+        let window_start = now - (now % BTC_UPDOWN_5M_WINDOW_SECS);
+        let slug = format!("btc-updown-5m-{window_start}");
+        let req = MarketBySlugRequest::builder().slug(&slug).build();
+        let market = self
+            .gamma
+            .market_by_slug(&req)
+            .await
+            .with_context(|| format!("looking up {slug}"))?;
+        let cid = market
+            .condition_id
+            .ok_or_else(|| anyhow!("{slug} has no condition_id"))?;
         Ok(cid.to_string())
     }
 

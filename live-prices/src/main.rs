@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::io::{Stdout, stdout};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -9,8 +11,9 @@ use crossterm::terminal::{
 };
 use futures::StreamExt;
 use polymarket_core::{
-    CoinbaseFeed, CoinbasePayload, Decimal, FeedSource, PolymarketEvent, PolymarketFeed,
-    PolymarketPayload, Polymarket, RecordedEvent, U256,
+    BitstampFeed, CexPayload, CexVenue, CoinbaseFeed, Decimal, FeedSource, KrakenFeed,
+    MarketSnapshot, PolymarketEvent, PolymarketFeed, PolymarketPayload, Polymarket,
+    RecordedEvent, U256,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -18,9 +21,19 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
+use tokio::task::JoinHandle;
 
 const COINBASE_PRODUCT: &str = "BTC-USD";
+const KRAKEN_SYMBOL: &str = "BTC/USD";
+const BITSTAMP_PAIR: &str = "btcusd";
+const WINDOW_SECS: u64 = 300;
+const VENUES: &[CexVenue] = &[CexVenue::Coinbase, CexVenue::Kraken, CexVenue::Bitstamp];
+/// A venue's last-trade is included in the running median only if it was
+/// updated within this window. Bitstamp's BTC/USD trade tape is sparse
+/// (often 10+ seconds between prints) so without this filter a stale
+/// Bitstamp print drags the median against fast Coinbase moves.
+const MEDIAN_FRESHNESS: Duration = Duration::from_secs(5);
 
 struct OutcomeRow {
     outcome: String,
@@ -34,6 +47,39 @@ struct OutcomeRow {
     last_trade_at: Option<Instant>,
 }
 
+#[derive(Default)]
+struct VenueState {
+    bid: Option<Decimal>,
+    ask: Option<Decimal>,
+    last: Option<Decimal>,
+    last_at: Option<Instant>,
+    evt_ticker: u64,
+    evt_trade: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TargetSource {
+    /// Pyth Network BTC/USD aggregate at the window-start timestamp.
+    Px,
+    /// Stopgap — median of CEX last-trades captured at first observation.
+    Md,
+}
+
+impl TargetSource {
+    fn tag(self) -> &'static str {
+        match self {
+            TargetSource::Px => "px",
+            TargetSource::Md => "md",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Target {
+    value: Decimal,
+    source: TargetSource,
+}
+
 struct AppState {
     question: String,
     slug: String,
@@ -41,12 +87,8 @@ struct AppState {
     outcomes: Vec<OutcomeRow>,
     last_event_at: Option<Instant>,
     last_error: Option<String>,
-    btc_bid: Option<Decimal>,
-    btc_ask: Option<Decimal>,
-    btc_last: Option<Decimal>,
-    last_btc_at: Option<Instant>,
-    btc_evt_ticker: u64,
-    btc_evt_trade: u64,
+    btc: HashMap<CexVenue, VenueState>,
+    btc_target: Option<Target>,
 }
 
 impl AppState {
@@ -55,24 +97,36 @@ impl AppState {
         self.last_event_at = Some(now);
         match evt {
             RecordedEvent::Polymarket(e) => self.apply_pm(&e, now),
-            RecordedEvent::Coinbase(e) => {
-                self.last_btc_at = Some(now);
+            RecordedEvent::Cex(e) => {
+                let v = self.btc.entry(e.venue).or_default();
+                v.last_at = Some(now);
                 match &e.payload {
-                    CoinbasePayload::Ticker {
+                    CexPayload::Ticker {
                         best_bid,
                         best_ask,
                         last,
                         ..
                     } => {
-                        self.btc_bid = Some(*best_bid);
-                        self.btc_ask = Some(*best_ask);
-                        self.btc_last = Some(*last);
-                        self.btc_evt_ticker += 1;
+                        v.bid = *best_bid;
+                        v.ask = *best_ask;
+                        v.last = Some(*last);
+                        v.evt_ticker += 1;
                     }
-                    CoinbasePayload::Trade { price, .. } => {
-                        self.btc_last = Some(*price);
-                        self.btc_evt_trade += 1;
+                    CexPayload::Trade { price, .. } => {
+                        v.last = Some(*price);
+                        v.evt_trade += 1;
                     }
+                }
+                if self.btc_target.is_none()
+                    && VENUES.iter().all(|v| {
+                        self.btc.get(v).and_then(|s| s.last).is_some()
+                    })
+                    && let Some(value) = self.btc_median_last()
+                {
+                    self.btc_target = Some(Target {
+                        value,
+                        source: TargetSource::Md,
+                    });
                 }
             }
             RecordedEvent::FeedError {
@@ -81,10 +135,45 @@ impl AppState {
                 let tag = match source {
                     FeedSource::Polymarket => "polymarket",
                     FeedSource::Coinbase => "coinbase",
+                    FeedSource::Kraken => "kraken",
+                    FeedSource::Bitstamp => "bitstamp",
                 };
                 self.last_error = Some(format!("[{tag}] {message}"));
             }
         }
+    }
+
+    fn btc_median_last(&self) -> Option<Decimal> {
+        let now = Instant::now();
+        let mut prices: Vec<Decimal> = VENUES
+            .iter()
+            .filter_map(|v| {
+                let s = self.btc.get(v)?;
+                let last_at = s.last_at?;
+                if now.saturating_duration_since(last_at) > MEDIAN_FRESHNESS {
+                    return None;
+                }
+                s.last
+            })
+            .collect();
+        if prices.is_empty() {
+            return None;
+        }
+        prices.sort();
+        let n = prices.len();
+        let mid = n / 2;
+        Some(if n % 2 == 1 {
+            prices[mid]
+        } else {
+            (prices[mid - 1] + prices[mid]) / Decimal::from(2)
+        })
+    }
+
+    fn newest_btc_at(&self) -> Option<Instant> {
+        VENUES
+            .iter()
+            .filter_map(|v| self.btc.get(v).and_then(|s| s.last_at))
+            .max()
     }
 
     fn apply_pm(&mut self, e: &PolymarketEvent, now: Instant) {
@@ -123,23 +212,23 @@ impl AppState {
     fn find_mut(&mut self, asset_id: &U256) -> Option<&mut OutcomeRow> {
         self.outcomes.iter_mut().find(|o| &o.token_id == asset_id)
     }
+
+    fn enter_new_window(&mut self, snapshot: MarketSnapshot, outcomes: Vec<OutcomeRow>) {
+        self.question = snapshot.question;
+        self.slug = snapshot.market_slug;
+        self.condition_id = snapshot.condition_id;
+        self.outcomes = outcomes;
+        self.last_event_at = None;
+        self.btc_target = None;
+    }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let arg = std::env::args()
-        .nth(1)
-        .ok_or_else(|| anyhow!("usage: live-prices <slug-or-condition_id>"))?;
-
-    let pm = Polymarket::new()?;
-    let condition_id = pm.resolve_condition_id(&arg).await?;
-    let snapshot = pm.fetch_snapshot(&condition_id).await?;
-
-    let outcomes: Vec<OutcomeRow> = snapshot
+fn outcomes_from_snapshot(snapshot: &MarketSnapshot) -> Vec<OutcomeRow> {
+    snapshot
         .outcomes
-        .into_iter()
+        .iter()
         .map(|o| OutcomeRow {
-            outcome: o.outcome,
+            outcome: o.outcome.clone(),
             token_id: o.token_id,
             bid: o.bid,
             bid_size: None,
@@ -149,49 +238,180 @@ async fn main() -> Result<()> {
             last_book_at: None,
             last_trade_at: None,
         })
-        .collect();
+        .collect()
+}
 
+fn next_window_boundary() -> Result<Instant> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system time before unix epoch")?;
+    let next_boundary_secs = (now.as_secs() / WINDOW_SECS + 1) * WINDOW_SECS;
+    let dur_until = Duration::from_secs(next_boundary_secs) - now;
+    Ok(Instant::now() + dur_until)
+}
+
+const TARGET_FETCH_RETRIES: u32 = 5;
+const TARGET_FETCH_BACKOFF: Duration = Duration::from_secs(2);
+
+type TargetMsg = Result<Decimal, String>;
+
+fn spawn_target_fetcher(
+    pm: Arc<Polymarket>,
+    tx: mpsc::UnboundedSender<TargetMsg>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        for attempt in 1..=TARGET_FETCH_RETRIES {
+            if attempt > 1 {
+                tokio::time::sleep(TARGET_FETCH_BACKOFF).await;
+            }
+            let reason = match pm.current_btc_updown_5m_target().await {
+                Ok(Some(v)) => {
+                    let _ = tx.send(Ok(v));
+                    return;
+                }
+                Ok(None) => "pyth returned no update for window-start ts".to_string(),
+                Err(e) => format!("{e:#}"),
+            };
+            let _ = tx.send(Err(format!(
+                "px target [{attempt}/{TARGET_FETCH_RETRIES}]: {reason}"
+            )));
+        }
+    })
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // rustls 0.23 needs an explicit default crypto provider; with multiple
+    // reqwest versions in the dep tree (ours + the sdk's), feature unification
+    // doesn't pick one for us. Pick ring at startup so every TLS client
+    // (CEX feeds, polymarket WS, reqwest) uses it.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let arg = std::env::args().nth(1);
+    let auto_roll = arg.is_none();
+
+    let pm = Arc::new(Polymarket::new()?);
+    let condition_id = match arg {
+        Some(a) => pm.resolve_condition_id(&a).await?,
+        None => pm
+            .current_btc_updown_5m_condition_id()
+            .await
+            .context("resolving current btc-updown-5m market")?,
+    };
+    let snapshot = pm.fetch_snapshot(&condition_id).await?;
+
+    let outcomes = outcomes_from_snapshot(&snapshot);
     if outcomes.is_empty() {
         return Err(anyhow!("market has no outcome tokens"));
     }
 
     let mut state = AppState {
-        question: snapshot.question,
-        slug: snapshot.market_slug,
-        condition_id,
+        question: snapshot.question.clone(),
+        slug: snapshot.market_slug.clone(),
+        condition_id: snapshot.condition_id.clone(),
         outcomes,
         last_event_at: None,
         last_error: None,
-        btc_bid: None,
-        btc_ask: None,
-        btc_last: None,
-        last_btc_at: None,
-        btc_evt_ticker: 0,
-        btc_evt_trade: 0,
+        btc: HashMap::new(),
+        btc_target: None,
     };
 
     let token_ids: Vec<U256> = state.outcomes.iter().map(|o| o.token_id).collect();
     let (tx, mut rx) = broadcast::channel::<RecordedEvent>(1024);
-    let _pm_feed = PolymarketFeed::start(token_ids, tx.clone())?;
-    let _cb_feed = CoinbaseFeed::start(COINBASE_PRODUCT, tx);
+    let mut pm_feed = Some(PolymarketFeed::start(token_ids, tx.clone())?);
+    let _cb_feed = CoinbaseFeed::start(COINBASE_PRODUCT, tx.clone());
+    let _kr_feed = KrakenFeed::start(KRAKEN_SYMBOL, tx.clone());
+    let _bs_feed = BitstampFeed::start(BITSTAMP_PAIR, tx.clone());
+
+    let (target_tx, mut target_rx) = mpsc::unbounded_channel::<TargetMsg>();
+    let mut target_fetcher: Option<JoinHandle<()>> = if auto_roll {
+        Some(spawn_target_fetcher(Arc::clone(&pm), target_tx.clone()))
+    } else {
+        None
+    };
 
     let mut terminal = init_terminal()?;
-    let res = run(&mut terminal, &mut state, &mut rx).await;
+    let res = run(
+        &mut terminal,
+        &mut state,
+        &mut rx,
+        &tx,
+        &pm,
+        &mut pm_feed,
+        &mut target_rx,
+        &target_tx,
+        &mut target_fetcher,
+        auto_roll,
+    )
+    .await;
     restore_terminal()?;
     res
+}
+
+async fn roll_window(
+    state: &mut AppState,
+    tx: &broadcast::Sender<RecordedEvent>,
+    pm: &Arc<Polymarket>,
+    pm_feed: &mut Option<PolymarketFeed>,
+    target_tx: &mpsc::UnboundedSender<TargetMsg>,
+    target_fetcher: &mut Option<JoinHandle<()>>,
+) -> Result<()> {
+    let condition_id = pm
+        .current_btc_updown_5m_condition_id()
+        .await
+        .context("resolving new btc-updown-5m market")?;
+    let snapshot = pm
+        .fetch_snapshot(&condition_id)
+        .await
+        .context("fetching new market snapshot")?;
+    let outcomes = outcomes_from_snapshot(&snapshot);
+    if outcomes.is_empty() {
+        anyhow::bail!("new market has no outcome tokens");
+    }
+    let token_ids: Vec<U256> = outcomes.iter().map(|o| o.token_id).collect();
+
+    *pm_feed = None;
+    *pm_feed = Some(PolymarketFeed::start(token_ids, tx.clone())?);
+
+    state.enter_new_window(snapshot, outcomes);
+
+    if let Some(h) = target_fetcher.take() {
+        h.abort();
+    }
+    *target_fetcher = Some(spawn_target_fetcher(Arc::clone(pm), target_tx.clone()));
+
+    Ok(())
 }
 
 async fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     state: &mut AppState,
     rx: &mut broadcast::Receiver<RecordedEvent>,
+    tx: &broadcast::Sender<RecordedEvent>,
+    pm: &Arc<Polymarket>,
+    pm_feed: &mut Option<PolymarketFeed>,
+    target_rx: &mut mpsc::UnboundedReceiver<TargetMsg>,
+    target_tx: &mpsc::UnboundedSender<TargetMsg>,
+    target_fetcher: &mut Option<JoinHandle<()>>,
+    auto_roll: bool,
 ) -> Result<()> {
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    let mut next_rollover: Option<Instant> = if auto_roll {
+        Some(next_window_boundary()?)
+    } else {
+        None
+    };
+
     loop {
         terminal.draw(|f| render(f, state))?;
+
+        let rollover_in = match next_rollover {
+            Some(t) => t.saturating_duration_since(Instant::now()),
+            None => Duration::from_secs(86400),
+        };
 
         tokio::select! {
             res = rx.recv() => {
@@ -221,6 +441,30 @@ async fn run(
                     return Ok(());
                 }
             }
+            _ = tokio::time::sleep(rollover_in), if auto_roll => {
+                match roll_window(state, tx, pm, pm_feed, target_tx, target_fetcher).await {
+                    Ok(()) => {
+                        next_rollover = next_window_boundary().ok();
+                    }
+                    Err(e) => {
+                        state.last_error = Some(format!("rollover failed: {e:#}"));
+                        next_rollover = Some(Instant::now() + Duration::from_secs(2));
+                    }
+                }
+                // Discard any pm-target value queued by the prior window's fetcher
+                // before we aborted it; otherwise we'd apply it to the new window.
+                while target_rx.try_recv().is_ok() {}
+            }
+            Some(msg) = target_rx.recv() => {
+                match msg {
+                    Ok(value) => {
+                        state.btc_target = Some(Target { value, source: TargetSource::Px });
+                    }
+                    Err(reason) => {
+                        state.last_error = Some(reason);
+                    }
+                }
+            }
             _ = tick.tick() => {}
         }
     }
@@ -232,7 +476,7 @@ fn should_quit(code: KeyCode, mods: KeyModifiers) -> bool {
 }
 
 fn render(f: &mut ratatui::Frame, state: &AppState) {
-    let header_height = 7 + state.last_error.is_some() as u16;
+    let header_height = 8 + state.last_error.is_some() as u16;
     let chunks = Layout::vertical([
         Constraint::Length(header_height),
         Constraint::Min(3),
@@ -264,24 +508,55 @@ fn header(state: &AppState) -> Paragraph<'_> {
         }
     };
 
-    let btc_line = {
-        let fmt = |v: Option<Decimal>, prec: usize| match v {
-            Some(d) => format!("{d:.*}", prec),
-            None => "—".to_string(),
-        };
-        let age = match state.last_btc_at {
+    let fmt_px = |v: Option<Decimal>, prec: usize| match v {
+        Some(d) => format!("{d:.*}", prec),
+        None => "—".to_string(),
+    };
+
+    let median = state.btc_median_last();
+    let median_line = {
+        let age = match state.newest_btc_at() {
             Some(t) => format!("{:.1}s", t.elapsed().as_secs_f64()),
             None => "—".to_string(),
         };
+        let delta = match (median, state.btc_target) {
+            (Some(l), Some(t)) => {
+                let d = l - t.value;
+                let sign = if d.is_sign_negative() { "" } else { "+" };
+                format!("{sign}{d:.2}")
+            }
+            _ => "—".to_string(),
+        };
+        let tgt_str = match state.btc_target {
+            Some(t) => format!("{:.2} ({})", t.value, t.source.tag()),
+            None => "—".to_string(),
+        };
         format!(
-            "last {} | bid {} ask {} | Δrecv {}  [ticker {} trade {}]",
-            fmt(state.btc_last, 2),
-            fmt(state.btc_bid, 2),
-            fmt(state.btc_ask, 2),
+            "med {} | tgt {} Δ {} | age {}",
+            fmt_px(median, 2),
+            tgt_str,
+            delta,
             age,
-            state.btc_evt_ticker,
-            state.btc_evt_trade,
         )
+    };
+
+    let venues_line = {
+        let parts: Vec<String> = VENUES
+            .iter()
+            .map(|venue| {
+                let s = state.btc.get(venue);
+                let last = s.and_then(|s| s.last);
+                let age = s
+                    .and_then(|s| s.last_at)
+                    .map(|t| format!("{:.1}s", t.elapsed().as_secs_f64()))
+                    .unwrap_or_else(|| "—".to_string());
+                let evts = s
+                    .map(|s| s.evt_ticker + s.evt_trade)
+                    .unwrap_or(0);
+                format!("{}={} ({} {}t)", venue.as_str(), fmt_px(last, 2), age, evts)
+            })
+            .collect();
+        parts.join(" | ")
     };
 
     let mut lines = vec![
@@ -298,8 +573,12 @@ fn header(state: &AppState) -> Paragraph<'_> {
             Span::raw(&state.condition_id),
         ]),
         Line::from(vec![
-            Span::styled("BTC-USD:   ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(btc_line),
+            Span::styled("BTC med:   ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(median_line),
+        ]),
+        Line::from(vec![
+            Span::styled("Venues:    ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(venues_line),
         ]),
         Line::from(vec![
             Span::styled("Status:    ", Style::default().add_modifier(Modifier::BOLD)),

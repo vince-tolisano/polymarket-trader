@@ -11,7 +11,15 @@ use crate::event::{
 use crate::{U256, WsClient};
 
 pub struct PolymarketFeed {
-    _tasks: Vec<JoinHandle<()>>,
+    tasks: Vec<JoinHandle<()>>,
+}
+
+impl Drop for PolymarketFeed {
+    fn drop(&mut self) {
+        for t in &self.tasks {
+            t.abort();
+        }
+    }
 }
 
 impl PolymarketFeed {
@@ -89,6 +97,6 @@ impl PolymarketFeed {
             }
         }));
 
-        Ok(Self { _tasks: tasks })
+        Ok(Self { tasks })
     }
 }

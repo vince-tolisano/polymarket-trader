@@ -24,12 +24,31 @@ impl EventClock {
 pub enum FeedSource {
     Polymarket,
     Coinbase,
+    Kraken,
+    Bitstamp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CexVenue {
+    Coinbase,
+    Kraken,
+    Bitstamp,
+}
+
+impl CexVenue {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CexVenue::Coinbase => "coinbase",
+            CexVenue::Kraken => "kraken",
+            CexVenue::Bitstamp => "bitstamp",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub enum RecordedEvent {
     Polymarket(Arc<PolymarketEvent>),
-    Coinbase(Arc<CoinbaseEvent>),
+    Cex(Arc<CexEvent>),
     FeedError {
         source: FeedSource,
         message: String,
@@ -51,10 +70,11 @@ pub enum PolymarketPayload {
 }
 
 #[derive(Debug)]
-pub struct CoinbaseEvent {
+pub struct CexEvent {
     pub clock: EventClock,
+    pub venue: CexVenue,
     pub product_id: String,
-    pub payload: CoinbasePayload,
+    pub payload: CexPayload,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,18 +84,18 @@ pub enum TradeSide {
 }
 
 #[derive(Debug)]
-pub enum CoinbasePayload {
+pub enum CexPayload {
     Ticker {
-        best_bid: Decimal,
-        best_bid_qty: Decimal,
-        best_ask: Decimal,
-        best_ask_qty: Decimal,
+        best_bid: Option<Decimal>,
+        best_bid_qty: Option<Decimal>,
+        best_ask: Option<Decimal>,
+        best_ask_qty: Option<Decimal>,
         last: Decimal,
     },
     Trade {
         price: Decimal,
         size: Decimal,
         side: TradeSide,
-        trade_id: String,
+        trade_id: Option<String>,
     },
 }
