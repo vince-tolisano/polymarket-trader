@@ -1,10 +1,10 @@
 [workspace]
 resolver = "3"
-members = ["core", "test-geo", "view-prices", "live-prices"]
+members = ["core", "test-geo", "view-prices", "live-prices", "lag-recorder"]
 
 [workspace.dependencies]
 polymarket_client_sdk_v2 = { version = "0.5", features = ["clob", "gamma", "ws"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
 anyhow = "1"
 rust_decimal = "1"
 alloy-primitives = "1"
