@@ -1,7 +1,15 @@
-// ITM tracker: per 5-min btc-updown-5m window, records the first and
-// best (lowest) ask seen in a configurable band on both YES and NO sides,
-// resolves the window via Pyth BTC/USD at window_end_ts, and writes one
-// CSV row per side per window with PnL per share.
+// Late-window scraping tracker. Strategy: in the last minute of a 5-min
+// btc-updown-5m window, enter a side whose ask sits in (min_ask, max_ask]
+// — default (0.95, 0.99] — and hold to settlement. The trade pays
+// (1 − ask) on a win and loses the full ask on a loss, so the strategy
+// needs a high win rate; the tracker exists to measure whether the
+// realized rate clears the breakeven bar.
+//
+// For each window and side (YES, NO), records the first qualifying ask.
+// At rollover resolves the window via Pyth BTC/USD at window_end_ts (with
+// retry + timestamp walkback, since Hermes 404s on boundary-aligned recent
+// timestamps) and writes one CSV row per triggered side with PnL per share.
+// Stderr emits a live alert at each trigger.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -15,32 +23,30 @@ use polymarket_core::{
     PolymarketPayload, RecordedEvent, U256,
 };
 use tokio::signal;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
+use tokio::task::JoinHandle;
 
 const WINDOW_SECS: u64 = 300;
 
-#[derive(Default, Clone, Copy)]
-struct OutcomeBook {
-    ask: Option<Decimal>,
+#[derive(Clone, Copy)]
+struct Entry {
+    ask: Decimal,
+    offset_s: u64,
 }
 
 #[derive(Default, Clone, Copy)]
-struct WindowEntry {
-    first_ask: Option<Decimal>,
-    first_offset_s: Option<u64>,
-    best_ask: Option<Decimal>,
-    best_offset_s: Option<u64>,
+struct SideState {
+    ask: Option<Decimal>,
+    entry: Option<Entry>,
 }
 
 struct PmState {
     yes_token: U256,
     no_token: Option<U256>,
-    yes_book: OutcomeBook,
-    no_book: OutcomeBook,
+    yes: SideState,
+    no: SideState,
     condition_id: String,
     window_start_ts: u64,
-    yes_entry: WindowEntry,
-    no_entry: WindowEntry,
     target_price: Option<Decimal>,
 }
 
@@ -49,19 +55,36 @@ struct State {
     out: BufWriter<File>,
     min_ask: Decimal,
     max_ask: Decimal,
+    min_offset_s: u64,
     n_entries: u64,
     n_wins: u64,
     n_losses: u64,
     n_unresolved: u64,
-    pnl_first: Decimal,
-    pnl_best: Decimal,
+    pnl: Decimal,
+}
+
+struct OldWindow {
+    window_start_ts: u64,
+    condition_id: String,
+    target: Option<Decimal>,
+    yes_entry: Option<Entry>,
+    no_entry: Option<Entry>,
+}
+
+struct ResolvedWindow {
+    window_start_ts: u64,
+    condition_id: String,
+    target: Option<Decimal>,
+    final_pyth: Option<Decimal>,
+    yes_entry: Option<Entry>,
+    no_entry: Option<Entry>,
 }
 
 fn write_header(w: &mut BufWriter<File>) -> Result<()> {
     writeln!(
         w,
-        "window_start_ts,condition_id,side,first_ask,first_offset_s,best_ask,best_offset_s,\
-         target_pyth,final_pyth,resolved_side,pnl_first,pnl_best"
+        "window_start_ts,condition_id,side,entry_ask,entry_offset_s,\
+         target_pyth,final_pyth,resolved_side,won,pnl"
     )?;
     w.flush()?;
     Ok(())
@@ -73,26 +96,22 @@ fn write_row(
     window_start_ts: u64,
     condition_id: &str,
     side: &str,
-    entry: &WindowEntry,
+    entry: Entry,
     target: Option<Decimal>,
     final_pyth: Option<Decimal>,
     resolved_side: Option<&str>,
-    pnl_first: Option<Decimal>,
-    pnl_best: Option<Decimal>,
+    won: Option<bool>,
+    pnl: Option<Decimal>,
 ) -> Result<()> {
-    let first_ask = entry.first_ask.map(|d| d.to_string()).unwrap_or_default();
-    let first_off = entry.first_offset_s.map(|s| s.to_string()).unwrap_or_default();
-    let best_ask = entry.best_ask.map(|d| d.to_string()).unwrap_or_default();
-    let best_off = entry.best_offset_s.map(|s| s.to_string()).unwrap_or_default();
     let target_s = target.map(|d| d.to_string()).unwrap_or_default();
     let final_s = final_pyth.map(|d| d.to_string()).unwrap_or_default();
     let resolved_s = resolved_side.unwrap_or("");
-    let pnl_first_s = pnl_first.map(|d| d.to_string()).unwrap_or_default();
-    let pnl_best_s = pnl_best.map(|d| d.to_string()).unwrap_or_default();
+    let won_s = won.map(|b| if b { "1" } else { "0" }).unwrap_or("");
+    let pnl_s = pnl.map(|d| d.to_string()).unwrap_or_default();
     writeln!(
         w,
-        "{window_start_ts},{condition_id},{side},{first_ask},{first_off},{best_ask},{best_off},\
-         {target_s},{final_s},{resolved_s},{pnl_first_s},{pnl_best_s}"
+        "{window_start_ts},{condition_id},{side},{},{},{target_s},{final_s},{resolved_s},{won_s},{pnl_s}",
+        entry.ask, entry.offset_s,
     )?;
     w.flush()?;
     Ok(())
@@ -136,66 +155,74 @@ fn now_wall_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn maybe_update_entry(
-    entry: &mut WindowEntry,
+/// First qualifying tick triggers a one-shot entry on the side. Later
+/// ticks just update the latest ask used in the summary line; we don't
+/// re-enter, since the real strategy would have already bought.
+fn try_trigger(
+    side_label: &str,
+    window_ts: u64,
+    side: &mut SideState,
     ask: Decimal,
+    offset_s: u64,
     min_ask: Decimal,
     max_ask: Decimal,
-    offset_s: u64,
+    min_offset_s: u64,
 ) {
-    if ask < min_ask || ask > max_ask {
+    side.ask = Some(ask);
+    if side.entry.is_some() {
         return;
     }
-    if entry.first_ask.is_none() {
-        entry.first_ask = Some(ask);
-        entry.first_offset_s = Some(offset_s);
+    if offset_s < min_offset_s {
+        return;
     }
-    match entry.best_ask {
-        None => {
-            entry.best_ask = Some(ask);
-            entry.best_offset_s = Some(offset_s);
-        }
-        Some(prev) if ask < prev => {
-            entry.best_ask = Some(ask);
-            entry.best_offset_s = Some(offset_s);
-        }
-        _ => {}
+    if ask <= min_ask || ask > max_ask {
+        return;
     }
+    side.entry = Some(Entry { ask, offset_s });
+    let remaining = WINDOW_SECS.saturating_sub(offset_s);
+    eprintln!(
+        ">>> ENTRY  window {window_ts}  {side_label} @ {ask}  (+{offset_s}s in, {remaining}s remaining)"
+    );
 }
 
 fn apply_pm(state: &mut State, e: &PolymarketEvent) {
     let yes = state.pm.yes_token;
     let no = state.pm.no_token;
     let offset_s = now_wall_secs().saturating_sub(state.pm.window_start_ts);
+    let min_ask = state.min_ask;
+    let max_ask = state.max_ask;
+    let min_off = state.min_offset_s;
+    let window_ts = state.pm.window_start_ts;
     match &e.payload {
         PolymarketPayload::Book(b) => {
             if b.asset_id == yes {
-                state.pm.yes_book.ask = b.asks.first().map(|l| l.price);
+                if let Some(a) = b.asks.first().map(|l| l.price) {
+                    try_trigger("YES", window_ts, &mut state.pm.yes, a, offset_s, min_ask, max_ask, min_off);
+                } else {
+                    state.pm.yes.ask = None;
+                }
             } else if Some(b.asset_id) == no {
-                state.pm.no_book.ask = b.asks.first().map(|l| l.price);
+                if let Some(a) = b.asks.first().map(|l| l.price) {
+                    try_trigger("NO ", window_ts, &mut state.pm.no, a, offset_s, min_ask, max_ask, min_off);
+                } else {
+                    state.pm.no.ask = None;
+                }
             }
         }
         PolymarketPayload::PriceChange(p) => {
             for entry in &p.price_changes {
                 if entry.asset_id == yes {
                     if let Some(ba) = entry.best_ask {
-                        state.pm.yes_book.ask = Some(ba);
+                        try_trigger("YES", window_ts, &mut state.pm.yes, ba, offset_s, min_ask, max_ask, min_off);
                     }
                 } else if Some(entry.asset_id) == no {
                     if let Some(ba) = entry.best_ask {
-                        state.pm.no_book.ask = Some(ba);
+                        try_trigger("NO ", window_ts, &mut state.pm.no, ba, offset_s, min_ask, max_ask, min_off);
                     }
                 }
             }
         }
         PolymarketPayload::LastTrade(_) => {}
-    }
-    let (min_ask, max_ask) = (state.min_ask, state.max_ask);
-    if let Some(ask) = state.pm.yes_book.ask {
-        maybe_update_entry(&mut state.pm.yes_entry, ask, min_ask, max_ask, offset_s);
-    }
-    if let Some(ask) = state.pm.no_book.ask {
-        maybe_update_entry(&mut state.pm.no_entry, ask, min_ask, max_ask, offset_s);
     }
 }
 
@@ -217,7 +244,7 @@ fn apply_event(state: &mut State, evt: RecordedEvent) {
     }
 }
 
-fn pnl_for_side(entry_ask: Decimal, win: bool) -> Decimal {
+fn pnl_for(entry_ask: Decimal, win: bool) -> Decimal {
     if win {
         Decimal::ONE - entry_ask
     } else {
@@ -225,48 +252,85 @@ fn pnl_for_side(entry_ask: Decimal, win: bool) -> Decimal {
     }
 }
 
-async fn flush_window_for_rollover(state: &mut State, pm: &Arc<Polymarket>) {
-    let window_end_ts = state.pm.window_start_ts + WINDOW_SECS;
-    let final_pyth = match pm.pyth_btc_usd_at(window_end_ts).await {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("WARN: fetching final pyth for ts {window_end_ts}: {e:#}");
-            None
+/// Hand off the closing window to the async resolver. Returns None when
+/// neither side triggered — nothing to log or resolve in that case.
+fn snapshot_window(state: &State) -> Option<OldWindow> {
+    if state.pm.yes.entry.is_none() && state.pm.no.entry.is_none() {
+        return None;
+    }
+    Some(OldWindow {
+        window_start_ts: state.pm.window_start_ts,
+        condition_id: state.pm.condition_id.clone(),
+        target: state.pm.target_price,
+        yes_entry: state.pm.yes.entry,
+        no_entry: state.pm.no.entry,
+    })
+}
+
+/// Hermes 404s on boundary-aligned recent timestamps: its index lags real
+/// time and Pyth updates don't always land on second boundaries. The BTC
+/// price 1–30s before window end is functionally identical for binary
+/// up/down resolution, so we walk the timestamp back on each retry rather
+/// than just waiting longer at the same one.
+async fn fetch_final_pyth_retry(pm: &Polymarket, window_end_ts: u64) -> Option<Decimal> {
+    // (delay before attempt, ts_offset_from_window_end_seconds)
+    let attempts = [(0_u64, 0_i64), (2, -1), (3, -3), (5, -10), (10, -30)];
+    for (i, &(delay, offset)) in attempts.iter().enumerate() {
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_secs(delay)).await;
         }
-    };
-    let target = state.pm.target_price;
-    let resolved_side = match (target, final_pyth) {
+        let ts = (window_end_ts as i64 + offset).max(0) as u64;
+        match pm.pyth_btc_usd_at(ts).await {
+            Ok(Some(v)) => return Some(v),
+            Ok(None) => continue,
+            Err(e) => {
+                let last = i + 1 == attempts.len();
+                let tag = if last { "give up" } else { "retry" };
+                eprintln!("WARN: pyth ts {ts} (offset {offset}s) attempt {} ({tag}): {e:#}", i + 1);
+            }
+        }
+    }
+    None
+}
+
+/// Spawned at each rollover so the new window can start subscribing
+/// immediately while Pyth catches up on the old window's end timestamp.
+async fn resolve_window(
+    old: OldWindow,
+    pm: Arc<Polymarket>,
+    tx: mpsc::UnboundedSender<ResolvedWindow>,
+) {
+    let window_end_ts = old.window_start_ts + WINDOW_SECS;
+    let final_pyth = fetch_final_pyth_retry(&pm, window_end_ts).await;
+    let _ = tx.send(ResolvedWindow {
+        window_start_ts: old.window_start_ts,
+        condition_id: old.condition_id,
+        target: old.target,
+        final_pyth,
+        yes_entry: old.yes_entry,
+        no_entry: old.no_entry,
+    });
+}
+
+fn sink_resolved(state: &mut State, r: ResolvedWindow) {
+    let resolved_side = match (r.target, r.final_pyth) {
         (Some(t), Some(f)) => Some(if f > t { "YES" } else { "NO" }),
         _ => None,
     };
-
-    let condition_id = state.pm.condition_id.clone();
-    let window_start_ts = state.pm.window_start_ts;
-    let yes_entry = state.pm.yes_entry;
-    let no_entry = state.pm.no_entry;
-
-    for (side, entry) in [("YES", yes_entry), ("NO", no_entry)] {
-        if entry.first_ask.is_none() {
-            continue;
-        }
-        let (pnl_first, pnl_best) = match resolved_side {
-            Some(r) => {
-                let win = r == side;
-                let pf = entry.first_ask.map(|a| pnl_for_side(a, win));
-                let pb = entry.best_ask.map(|a| pnl_for_side(a, win));
+    for (side, entry_opt) in [("YES", r.yes_entry), ("NO", r.no_entry)] {
+        let Some(entry) = entry_opt else { continue };
+        let (won, pnl) = match resolved_side {
+            Some(rs) => {
+                let win = rs == side;
+                let p = pnl_for(entry.ask, win);
                 state.n_entries += 1;
                 if win {
                     state.n_wins += 1;
                 } else {
                     state.n_losses += 1;
                 }
-                if let Some(p) = pf {
-                    state.pnl_first += p;
-                }
-                if let Some(p) = pb {
-                    state.pnl_best += p;
-                }
-                (pf, pb)
+                state.pnl += p;
+                (Some(win), Some(p))
             }
             None => {
                 state.n_unresolved += 1;
@@ -275,15 +339,15 @@ async fn flush_window_for_rollover(state: &mut State, pm: &Arc<Polymarket>) {
         };
         if let Err(e) = write_row(
             &mut state.out,
-            window_start_ts,
-            &condition_id,
+            r.window_start_ts,
+            &r.condition_id,
             side,
-            &entry,
-            target,
-            final_pyth,
+            entry,
+            r.target,
+            r.final_pyth,
             resolved_side,
-            pnl_first,
-            pnl_best,
+            won,
+            pnl,
         ) {
             eprintln!("WARN: write row: {e:#}");
         }
@@ -318,42 +382,43 @@ async fn roll_window(
     state.pm = PmState {
         yes_token,
         no_token,
-        yes_book: OutcomeBook::default(),
-        no_book: OutcomeBook::default(),
+        yes: SideState::default(),
+        no: SideState::default(),
         condition_id: snapshot.condition_id,
         window_start_ts,
-        yes_entry: WindowEntry::default(),
-        no_entry: WindowEntry::default(),
         target_price: target,
     };
     Ok(())
 }
 
+fn fmt_opt(d: Option<Decimal>) -> String {
+    d.map(|v| format!("{v:.4}")).unwrap_or_else(|| "—".into())
+}
+
 fn print_summary(state: &State, t_start: Instant) {
     let elapsed = t_start.elapsed().as_secs_f64();
     let resolved = state.n_wins + state.n_losses;
-    let (win_rate, avg_first, avg_best) = if resolved > 0 {
+    let (win_rate, avg_pnl) = if resolved > 0 {
         (
             state.n_wins as f64 * 100.0 / resolved as f64,
-            state.pnl_first / Decimal::from(resolved),
-            state.pnl_best / Decimal::from(resolved),
+            state.pnl / Decimal::from(resolved),
         )
     } else {
-        (0.0, Decimal::ZERO, Decimal::ZERO)
+        (0.0, Decimal::ZERO)
     };
     eprintln!(
         "[{:>7.1}s] entries={} wins={} losses={} unresolved={} | win_rate={:.1}% \
-         pnl_first={} (avg {}) pnl_best={} (avg {})",
+         pnl={} (avg {}) | YES ask={} NO ask={}",
         elapsed,
         state.n_entries,
         state.n_wins,
         state.n_losses,
         state.n_unresolved,
         win_rate,
-        state.pnl_first,
-        avg_first,
-        state.pnl_best,
-        avg_best,
+        state.pnl,
+        avg_pnl,
+        fmt_opt(state.pm.yes.ask),
+        fmt_opt(state.pm.no.ask),
     );
 }
 
@@ -364,8 +429,9 @@ async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let mut out_path: Option<PathBuf> = None;
     let mut explicit_market: Option<String> = None;
-    let mut min_ask = Decimal::new(95, 2); // 0.95
-    let mut max_ask = Decimal::new(99, 2); // 0.99
+    let mut min_ask = Decimal::new(95, 2);
+    let mut max_ask = Decimal::new(99, 2);
+    let mut min_offset_s: u64 = 240;
     while let Some(a) = args.next() {
         match a.as_str() {
             "-o" | "--out" => {
@@ -380,6 +446,12 @@ async fn main() -> Result<()> {
             "--max-ask" => {
                 let v = args.next().context("--max-ask needs a value")?;
                 max_ask = v.parse().with_context(|| format!("parsing --max-ask {v}"))?;
+            }
+            "--min-offset" => {
+                let v = args.next().context("--min-offset needs a value")?;
+                min_offset_s = v
+                    .parse()
+                    .with_context(|| format!("parsing --min-offset {v}"))?;
             }
             other => {
                 if explicit_market.is_none() {
@@ -405,7 +477,10 @@ async fn main() -> Result<()> {
     );
     write_header(&mut out)?;
     eprintln!("writing to {}", out_path.display());
-    eprintln!("entry band: ask in [{min_ask}, {max_ask}]");
+    eprintln!(
+        "strategy: enter at ask in ({min_ask}, {max_ask}] at offset ≥ {min_offset_s}s ({}s remaining)",
+        WINDOW_SECS.saturating_sub(min_offset_s),
+    );
 
     let pm = Arc::new(Polymarket::new()?);
     let condition_id = match &explicit_market {
@@ -437,23 +512,21 @@ async fn main() -> Result<()> {
         pm: PmState {
             yes_token,
             no_token,
-            yes_book: OutcomeBook::default(),
-            no_book: OutcomeBook::default(),
+            yes: SideState::default(),
+            no: SideState::default(),
             condition_id: snapshot.condition_id.clone(),
             window_start_ts,
-            yes_entry: WindowEntry::default(),
-            no_entry: WindowEntry::default(),
             target_price: target,
         },
         out,
         min_ask,
         max_ask,
+        min_offset_s,
         n_entries: 0,
         n_wins: 0,
         n_losses: 0,
         n_unresolved: 0,
-        pnl_first: Decimal::ZERO,
-        pnl_best: Decimal::ZERO,
+        pnl: Decimal::ZERO,
     };
 
     let t_start = Instant::now();
@@ -464,6 +537,9 @@ async fn main() -> Result<()> {
     };
     let mut summary_tick = tokio::time::interval(Duration::from_secs(30));
     summary_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    let (resolved_tx, mut resolved_rx) = mpsc::unbounded_channel::<ResolvedWindow>();
+    let mut resolver_tasks: Vec<JoinHandle<()>> = Vec::new();
 
     let outcome: Result<()> = loop {
         let rollover_in = match next_rollover {
@@ -478,9 +554,7 @@ async fn main() -> Result<()> {
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         eprintln!("WARN: broadcast lagged {n}");
                     }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        break Ok(());
-                    }
+                    Err(broadcast::error::RecvError::Closed) => break Ok(()),
                 }
                 loop {
                     match rx.try_recv() {
@@ -493,8 +567,23 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            Some(r) = resolved_rx.recv() => {
+                sink_resolved(&mut state, r);
+            }
             _ = tokio::time::sleep(rollover_in), if auto_roll => {
-                flush_window_for_rollover(&mut state, &pm).await;
+                eprintln!(
+                    "window {} closing: YES entry={} NO entry={}",
+                    state.pm.window_start_ts,
+                    state.pm.yes.entry.map(|e| format!("{}@{}s", e.ask, e.offset_s)).unwrap_or_else(|| "—".into()),
+                    state.pm.no.entry.map(|e| format!("{}@{}s", e.ask, e.offset_s)).unwrap_or_else(|| "—".into()),
+                );
+                if let Some(old) = snapshot_window(&state) {
+                    let pm_c = pm.clone();
+                    let tx_c = resolved_tx.clone();
+                    resolver_tasks.push(tokio::spawn(async move {
+                        resolve_window(old, pm_c, tx_c).await;
+                    }));
+                }
                 match roll_window(&mut state, &tx, &pm, &mut pm_feed).await {
                     Ok(()) => {
                         next_rollover = next_window_boundary().ok();
@@ -516,7 +605,23 @@ async fn main() -> Result<()> {
         }
     };
 
-    flush_window_for_rollover(&mut state, &pm).await;
+    // Drain any in-flight resolutions on shutdown — without this, the final
+    // window(s) would be lost since their Pyth lookup is still in progress.
+    if let Some(old) = snapshot_window(&state) {
+        let pm_c = pm.clone();
+        let tx_c = resolved_tx.clone();
+        resolver_tasks.push(tokio::spawn(async move {
+            resolve_window(old, pm_c, tx_c).await;
+        }));
+    }
+    drop(resolved_tx);
+    eprintln!("waiting on {} pending window resolution(s)…", resolver_tasks.len());
+    for h in resolver_tasks {
+        let _ = h.await;
+    }
+    while let Some(r) = resolved_rx.recv().await {
+        sink_resolved(&mut state, r);
+    }
     state.out.flush()?;
     print_summary(&state, t_start);
     outcome
