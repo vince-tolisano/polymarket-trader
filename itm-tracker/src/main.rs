@@ -37,6 +37,7 @@ struct Entry {
 #[derive(Default, Clone, Copy)]
 struct SideState {
     ask: Option<Decimal>,
+    bid: Option<Decimal>,
     entry: Option<Entry>,
 }
 
@@ -55,6 +56,7 @@ struct State {
     out: BufWriter<File>,
     min_ask: Decimal,
     max_ask: Decimal,
+    min_bid: Decimal,
     min_offset_s: u64,
     n_entries: u64,
     n_wins: u64,
@@ -158,6 +160,7 @@ fn now_wall_secs() -> u64 {
 /// First qualifying tick triggers a one-shot entry on the side. Later
 /// ticks just update the latest ask used in the summary line; we don't
 /// re-enter, since the real strategy would have already bought.
+#[allow(clippy::too_many_arguments)]
 fn try_trigger(
     side_label: &str,
     window_ts: u64,
@@ -166,6 +169,7 @@ fn try_trigger(
     offset_s: u64,
     min_ask: Decimal,
     max_ask: Decimal,
+    min_bid: Decimal,
     min_offset_s: u64,
 ) {
     side.ask = Some(ask);
@@ -178,10 +182,18 @@ fn try_trigger(
     if ask <= min_ask || ask > max_ask {
         return;
     }
+    // Require the bid to also be high: filters out wide-spread thin books
+    // where both YES and NO asks sit near 1.00 with bids near 0.
+    let Some(bid) = side.bid else {
+        return;
+    };
+    if bid < min_bid {
+        return;
+    }
     side.entry = Some(Entry { ask, offset_s });
     let remaining = WINDOW_SECS.saturating_sub(offset_s);
     eprintln!(
-        ">>> ENTRY  window {window_ts}  {side_label} @ {ask}  (+{offset_s}s in, {remaining}s remaining)"
+        ">>> ENTRY  window {window_ts}  {side_label} @ {ask} (bid {bid})  (+{offset_s}s in, {remaining}s remaining)"
     );
 }
 
@@ -191,33 +203,44 @@ fn apply_pm(state: &mut State, e: &PolymarketEvent) {
     let offset_s = now_wall_secs().saturating_sub(state.pm.window_start_ts);
     let min_ask = state.min_ask;
     let max_ask = state.max_ask;
+    let min_bid = state.min_bid;
     let min_off = state.min_offset_s;
     let window_ts = state.pm.window_start_ts;
     match &e.payload {
         PolymarketPayload::Book(b) => {
-            if b.asset_id == yes {
-                if let Some(a) = b.asks.first().map(|l| l.price) {
-                    try_trigger("YES", window_ts, &mut state.pm.yes, a, offset_s, min_ask, max_ask, min_off);
-                } else {
-                    state.pm.yes.ask = None;
-                }
+            // Update bid/ask together — the bid filter in try_trigger reads
+            // the side's stored bid, so it must be current before we trigger.
+            let side_state = if b.asset_id == yes {
+                Some(("YES", &mut state.pm.yes))
             } else if Some(b.asset_id) == no {
+                Some(("NO ", &mut state.pm.no))
+            } else {
+                None
+            };
+            if let Some((label, side)) = side_state {
+                side.bid = b.bids.first().map(|l| l.price);
                 if let Some(a) = b.asks.first().map(|l| l.price) {
-                    try_trigger("NO ", window_ts, &mut state.pm.no, a, offset_s, min_ask, max_ask, min_off);
+                    try_trigger(label, window_ts, side, a, offset_s, min_ask, max_ask, min_bid, min_off);
                 } else {
-                    state.pm.no.ask = None;
+                    side.ask = None;
                 }
             }
         }
         PolymarketPayload::PriceChange(p) => {
             for entry in &p.price_changes {
-                if entry.asset_id == yes {
-                    if let Some(ba) = entry.best_ask {
-                        try_trigger("YES", window_ts, &mut state.pm.yes, ba, offset_s, min_ask, max_ask, min_off);
-                    }
+                let side_state = if entry.asset_id == yes {
+                    Some(("YES", &mut state.pm.yes))
                 } else if Some(entry.asset_id) == no {
+                    Some(("NO ", &mut state.pm.no))
+                } else {
+                    None
+                };
+                if let Some((label, side)) = side_state {
+                    if let Some(bb) = entry.best_bid {
+                        side.bid = Some(bb);
+                    }
                     if let Some(ba) = entry.best_ask {
-                        try_trigger("NO ", window_ts, &mut state.pm.no, ba, offset_s, min_ask, max_ask, min_off);
+                        try_trigger(label, window_ts, side, ba, offset_s, min_ask, max_ask, min_bid, min_off);
                     }
                 }
             }
@@ -431,6 +454,7 @@ async fn main() -> Result<()> {
     let mut explicit_market: Option<String> = None;
     let mut min_ask = Decimal::new(95, 2);
     let mut max_ask = Decimal::new(99, 2);
+    let mut min_bid = Decimal::new(50, 2);
     let mut min_offset_s: u64 = 240;
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -446,6 +470,10 @@ async fn main() -> Result<()> {
             "--max-ask" => {
                 let v = args.next().context("--max-ask needs a value")?;
                 max_ask = v.parse().with_context(|| format!("parsing --max-ask {v}"))?;
+            }
+            "--min-bid" => {
+                let v = args.next().context("--min-bid needs a value")?;
+                min_bid = v.parse().with_context(|| format!("parsing --min-bid {v}"))?;
             }
             "--min-offset" => {
                 let v = args.next().context("--min-offset needs a value")?;
@@ -478,7 +506,7 @@ async fn main() -> Result<()> {
     write_header(&mut out)?;
     eprintln!("writing to {}", out_path.display());
     eprintln!(
-        "strategy: enter at ask in ({min_ask}, {max_ask}] at offset ≥ {min_offset_s}s ({}s remaining)",
+        "strategy: enter at ask in ({min_ask}, {max_ask}] AND bid ≥ {min_bid} at offset ≥ {min_offset_s}s ({}s remaining)",
         WINDOW_SECS.saturating_sub(min_offset_s),
     );
 
@@ -521,6 +549,7 @@ async fn main() -> Result<()> {
         out,
         min_ask,
         max_ask,
+        min_bid,
         min_offset_s,
         n_entries: 0,
         n_wins: 0,

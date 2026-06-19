@@ -217,4 +217,20 @@ impl Polymarket {
             outcomes,
         })
     }
+
+    /// Look up the on-chain resolved winner via Polymarket's CLOB market
+    /// endpoint. Returns `Ok(Some(token_id))` once `market.closed == true`
+    /// and a token with `winner == true` is present; `Ok(None)` while the
+    /// market is still open / awaiting oracle resolution.
+    pub async fn market_winner(&self, condition_id: &str) -> Result<Option<U256>> {
+        let market = self
+            .clob
+            .market(condition_id)
+            .await
+            .with_context(|| format!("fetching market {condition_id}"))?;
+        if !market.closed {
+            return Ok(None);
+        }
+        Ok(market.tokens.iter().find(|t| t.winner).map(|t| t.token_id))
+    }
 }

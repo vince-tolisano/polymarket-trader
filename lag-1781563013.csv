@@ -1,3 +1,0 @@
-trigger_wall_ms,direction,median_before,median_after,median_delta,pm_yes_mid_at_trigger,pm_no_mid_at_trigger,status,lag_ms,pm_yes_mid_at_reaction,pm_yes_mid_delta,yes_token_id,condition_id,window_start_ts
-1781563023041,down,66233.67,66221.9,-11.77,0.6150,0.3850,reacted,19,0.50,-0.1150,0x7d09ddb42c0c2dfda26679571390cad3863a894709e43b44774cd3cd315db25e,0xe063e0503fcc538a8974b24625894a7469a96d67d3cd5b8080c55df6af2928ea,1781562900
-1781563043993,up,66216.57,66230.45,13.88,0.50,0.35,reacted,3,0.65,0.15,0x7d09ddb42c0c2dfda26679571390cad3863a894709e43b44774cd3cd315db25e,0xe063e0503fcc538a8974b24625894a7469a96d67d3cd5b8080c55df6af2928ea,1781562900

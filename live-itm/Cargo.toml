@@ -1,0 +1,13 @@
+[package]
+name = "live-itm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+polymarket-core = { path = "../core" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+rustls = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+futures = { workspace = true }
