@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["core", "test-geo", "view-prices", "live-prices", "lag-recorder", "itm-tracker", "live-itm", "feature-recorder"]
+members = ["core", "view-prices", "live-prices", "lag-recorder", "itm-tracker", "live-itm", "feature-recorder"]
 
 [workspace.dependencies]
 polymarket_client_sdk_v2 = { version = "0.5", features = ["clob", "gamma", "ws"] }
