@@ -4643,15 +4643,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "test-geo"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "polymarket_client_sdk_v2",
- "tokio",
-]
-
-[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -58,6 +58,7 @@ struct State {
     max_ask: Decimal,
     min_bid: Decimal,
     min_offset_s: u64,
+    max_offset_s: u64,
     n_entries: u64,
     n_wins: u64,
     n_losses: u64,
@@ -171,12 +172,15 @@ fn try_trigger(
     max_ask: Decimal,
     min_bid: Decimal,
     min_offset_s: u64,
+    max_offset_s: u64,
 ) {
     side.ask = Some(ask);
     if side.entry.is_some() {
         return;
     }
-    if offset_s < min_offset_s {
+    // Eligible window is [min_offset_s, max_offset_s): too late (default
+    // last 10s) leaves no time to fill and risks the resolution print first.
+    if offset_s < min_offset_s || offset_s >= max_offset_s {
         return;
     }
     if ask <= min_ask || ask > max_ask {
@@ -205,6 +209,7 @@ fn apply_pm(state: &mut State, e: &PolymarketEvent) {
     let max_ask = state.max_ask;
     let min_bid = state.min_bid;
     let min_off = state.min_offset_s;
+    let max_off = state.max_offset_s;
     let window_ts = state.pm.window_start_ts;
     match &e.payload {
         PolymarketPayload::Book(b) => {
@@ -220,7 +225,7 @@ fn apply_pm(state: &mut State, e: &PolymarketEvent) {
             if let Some((label, side)) = side_state {
                 side.bid = b.bids.first().map(|l| l.price);
                 if let Some(a) = b.asks.first().map(|l| l.price) {
-                    try_trigger(label, window_ts, side, a, offset_s, min_ask, max_ask, min_bid, min_off);
+                    try_trigger(label, window_ts, side, a, offset_s, min_ask, max_ask, min_bid, min_off, max_off);
                 } else {
                     side.ask = None;
                 }
@@ -240,7 +245,7 @@ fn apply_pm(state: &mut State, e: &PolymarketEvent) {
                         side.bid = Some(bb);
                     }
                     if let Some(ba) = entry.best_ask {
-                        try_trigger(label, window_ts, side, ba, offset_s, min_ask, max_ask, min_bid, min_off);
+                        try_trigger(label, window_ts, side, ba, offset_s, min_ask, max_ask, min_bid, min_off, max_off);
                     }
                 }
             }
@@ -456,6 +461,7 @@ async fn main() -> Result<()> {
     let mut max_ask = Decimal::new(99, 2);
     let mut min_bid = Decimal::new(50, 2);
     let mut min_offset_s: u64 = 240;
+    let mut max_offset_s: u64 = WINDOW_SECS - 10;
     while let Some(a) = args.next() {
         match a.as_str() {
             "-o" | "--out" => {
@@ -480,6 +486,12 @@ async fn main() -> Result<()> {
                 min_offset_s = v
                     .parse()
                     .with_context(|| format!("parsing --min-offset {v}"))?;
+            }
+            "--max-offset" => {
+                let v = args.next().context("--max-offset needs a value")?;
+                max_offset_s = v
+                    .parse()
+                    .with_context(|| format!("parsing --max-offset {v}"))?;
             }
             other => {
                 if explicit_market.is_none() {
@@ -506,8 +518,9 @@ async fn main() -> Result<()> {
     write_header(&mut out)?;
     eprintln!("writing to {}", out_path.display());
     eprintln!(
-        "strategy: enter at ask in ({min_ask}, {max_ask}] AND bid ≥ {min_bid} at offset ≥ {min_offset_s}s ({}s remaining)",
+        "strategy: enter at ask in ({min_ask}, {max_ask}] AND bid ≥ {min_bid} at offset [{min_offset_s}, {max_offset_s})s ({}s–{}s remaining)",
         WINDOW_SECS.saturating_sub(min_offset_s),
+        WINDOW_SECS.saturating_sub(max_offset_s),
     );
 
     let pm = Arc::new(Polymarket::new()?);
@@ -551,6 +564,7 @@ async fn main() -> Result<()> {
         max_ask,
         min_bid,
         min_offset_s,
+        max_offset_s,
         n_entries: 0,
         n_wins: 0,
         n_losses: 0,

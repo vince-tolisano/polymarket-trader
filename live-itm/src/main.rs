@@ -176,6 +176,7 @@ struct AppState {
     max_ask: Decimal,
     min_bid: Decimal,
     min_offset_s: u64,
+    max_offset_s: u64,
     swing_lookback: Duration,
 
     n_entries: u64,
@@ -290,6 +291,7 @@ impl AppState {
         let max_ask = self.max_ask;
         let min_bid = self.min_bid;
         let min_off = self.min_offset_s;
+        let max_off = self.max_offset_s;
         let window_ts = self.window_start_ts;
         // Direction confirmation: only enter the side BTC is currently
         // showing. None when target or median is missing — skip the trigger
@@ -318,7 +320,7 @@ impl AppState {
                         row.push_ask_sample(now, ask);
                         let swing = row.ask_move_over(swing_lookback);
                         if !window_locked {
-                            try_trigger(row, ask, offset_s, min_ask, max_ask, min_bid, min_off, direction, swing, window_ts);
+                            try_trigger(row, ask, offset_s, min_ask, max_ask, min_bid, min_off, max_off, direction, swing, window_ts);
                         }
                     }
                 }
@@ -334,7 +336,7 @@ impl AppState {
                             row.push_ask_sample(now, ba);
                             let swing = row.ask_move_over(swing_lookback);
                             if !window_locked {
-                                try_trigger(row, ba, offset_s, min_ask, max_ask, min_bid, min_off, direction, swing, window_ts);
+                                try_trigger(row, ba, offset_s, min_ask, max_ask, min_bid, min_off, max_off, direction, swing, window_ts);
                             }
                         }
                         row.last_book_at = Some(now);
@@ -410,6 +412,7 @@ fn try_trigger(
     max_ask: Decimal,
     min_bid: Decimal,
     min_offset_s: u64,
+    max_offset_s: u64,
     direction: Option<&'static str>,
     swing: Option<Decimal>,
     _window_ts: u64,
@@ -417,7 +420,10 @@ fn try_trigger(
     if row.entry.is_some() {
         return;
     }
-    if offset_s < min_offset_s {
+    // Eligible window is [min_offset_s, max_offset_s): too early gives a
+    // worse signal, too late (default last 10s) leaves no time to fill and
+    // risks the resolution print landing first.
+    if offset_s < min_offset_s || offset_s >= max_offset_s {
         return;
     }
     if ask < min_ask || ask > max_ask {
@@ -855,6 +861,7 @@ async fn main() -> Result<()> {
     let mut max_ask = Decimal::new(99, 2);
     let mut min_bid = Decimal::new(50, 2);
     let mut min_offset_s: u64 = 240;
+    let mut max_offset_s: u64 = WINDOW_SECS - 10;
     let mut swing_lookback_s: u64 = 10;
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -880,6 +887,12 @@ async fn main() -> Result<()> {
                 min_offset_s = v
                     .parse()
                     .with_context(|| format!("parsing --min-offset {v}"))?;
+            }
+            "--max-offset" => {
+                let v = args.next().context("--max-offset needs a value")?;
+                max_offset_s = v
+                    .parse()
+                    .with_context(|| format!("parsing --max-offset {v}"))?;
             }
             "--swing-lookback" => {
                 let v = args.next().context("--swing-lookback needs a value")?;
@@ -940,6 +953,7 @@ async fn main() -> Result<()> {
         max_ask,
         min_bid,
         min_offset_s,
+        max_offset_s,
         swing_lookback: Duration::from_secs(swing_lookback_s),
         n_entries: 0,
         n_wins: 0,
@@ -1289,7 +1303,7 @@ fn header(state: &AppState) -> Paragraph<'_> {
 fn strategy_panel(state: &AppState) -> Paragraph<'_> {
     let offset = state.offset_s();
     let remaining = state.time_remaining_s();
-    let eligible = offset >= state.min_offset_s;
+    let eligible = offset >= state.min_offset_s && offset < state.max_offset_s;
     let direction_opt: Option<&'static str> = match (state.btc_target, state.btc_median_last()) {
         (Some(t), Some(m)) if m > t.value => Some("YES"),
         (Some(t), Some(m)) if m < t.value => Some("NO "),
@@ -1315,13 +1329,18 @@ fn strategy_panel(state: &AppState) -> Paragraph<'_> {
     let (status_text, status_color) = if eligible {
         ("ACTIVE", Color::Green)
     } else {
-        let until = state.min_offset_s.saturating_sub(offset);
+        let window_note = if offset >= state.max_offset_s {
+            "window closed".to_string()
+        } else {
+            format!("eligible in {}s", state.min_offset_s.saturating_sub(offset))
+        };
         return Paragraph::new(vec![
             Line::from(vec![
                 Span::styled("Band:      ", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw(format!(
-                    "ask in [{}, {}], bid ≥ {}, dir matches BTC   eligible after offset ≥{}s",
-                    state.min_ask, state.max_ask, state.min_bid, state.min_offset_s
+                    "ask in [{}, {}], bid ≥ {}, dir matches BTC   eligible offset [{}, {})s",
+                    state.min_ask, state.max_ask, state.min_bid,
+                    state.min_offset_s, state.max_offset_s
                 )),
             ]),
             Line::from(vec![
@@ -1337,7 +1356,7 @@ fn strategy_panel(state: &AppState) -> Paragraph<'_> {
                 Span::raw(format!("offset {offset}s, {remaining}s remaining")),
                 Span::raw("   "),
                 Span::styled(
-                    format!("eligible in {until}s"),
+                    window_note,
                     Style::default().fg(Color::DarkGray),
                 ),
             ]),
