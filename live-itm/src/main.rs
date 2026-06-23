@@ -912,12 +912,15 @@ async fn main() -> Result<()> {
     let auto_roll = explicit_market.is_none();
 
     let out_path = out_path.unwrap_or_else(|| {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        PathBuf::from(format!("live-itm-{ts}.csv"))
+        // Local wall-clock stamp. Windows forbids ':' in filenames, so the
+        // hh:mm separator is rendered as '.' (data/mm-dd-yyyy-hh.mm.csv).
+        let stamp = chrono::Local::now().format("%m-%d-%Y-%H.%M");
+        PathBuf::from(format!("data/{stamp}.csv"))
     });
+    if let Some(parent) = out_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating dir {}", parent.display()))?;
+    }
     let mut out = BufWriter::new(
         File::create(&out_path)
             .with_context(|| format!("creating {}", out_path.display()))?,

@@ -11,3 +11,4 @@ rustls = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 futures = { workspace = true }
+chrono = "0.4"
