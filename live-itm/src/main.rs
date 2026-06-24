@@ -41,6 +41,10 @@ const BITSTAMP_PAIR: &str = "btcusd";
 const WINDOW_SECS: u64 = 300;
 const VENUES: &[CexVenue] = &[CexVenue::Coinbase, CexVenue::Kraken, CexVenue::Bitstamp];
 const MEDIAN_FRESHNESS: Duration = Duration::from_secs(5);
+/// A trade only triggers if the side's order book moved within this window.
+/// If the previous book update was more than this ago the book has been
+/// stale — the print waking it up is unreliable, so we skip the trigger.
+const BOOK_FRESHNESS: Duration = Duration::from_secs(5);
 
 const TARGET_FETCH_RETRIES: u32 = 5;
 const TARGET_FETCH_BACKOFF: Duration = Duration::from_secs(2);
@@ -311,6 +315,7 @@ impl AppState {
         match &e.payload {
             PolymarketPayload::Book(b) => {
                 if let Some(row) = self.find_mut(&b.asset_id) {
+                    let book_fresh = book_fresh(row.last_book_at, now);
                     row.bid = b.bids.first().map(|l| l.price);
                     row.bid_size = b.bids.first().map(|l| l.size);
                     row.ask = b.asks.first().map(|l| l.price);
@@ -319,7 +324,7 @@ impl AppState {
                     if let Some(ask) = row.ask {
                         row.push_ask_sample(now, ask);
                         let swing = row.ask_move_over(swing_lookback);
-                        if !window_locked {
+                        if !window_locked && book_fresh {
                             try_trigger(row, ask, offset_s, min_ask, max_ask, min_bid, min_off, max_off, direction, swing, window_ts);
                         }
                     }
@@ -328,6 +333,7 @@ impl AppState {
             PolymarketPayload::PriceChange(p) => {
                 for entry in &p.price_changes {
                     if let Some(row) = self.find_mut(&entry.asset_id) {
+                        let book_fresh = book_fresh(row.last_book_at, now);
                         if let Some(bb) = entry.best_bid {
                             row.bid = Some(bb);
                         }
@@ -335,7 +341,7 @@ impl AppState {
                             row.ask = Some(ba);
                             row.push_ask_sample(now, ba);
                             let swing = row.ask_move_over(swing_lookback);
-                            if !window_locked {
+                            if !window_locked && book_fresh {
                                 try_trigger(row, ba, offset_s, min_ask, max_ask, min_bid, min_off, max_off, direction, swing, window_ts);
                             }
                         }
@@ -400,6 +406,17 @@ impl AppState {
         self.window_start_ts = window_start_ts;
         self.last_event_at = None;
         self.btc_target = None;
+    }
+}
+
+/// True iff the side's book moved recently enough to act on. `prev_book_at`
+/// is the row's *previous* `last_book_at` (captured before the current event
+/// overwrote it). If the last movement was over `BOOK_FRESHNESS` ago — or the
+/// book hasn't moved at all this window — the book is stale and we don't trade.
+fn book_fresh(prev_book_at: Option<Instant>, now: Instant) -> bool {
+    match prev_book_at {
+        Some(t) => now.saturating_duration_since(t) <= BOOK_FRESHNESS,
+        None => false,
     }
 }
 
