@@ -1,10 +1,12 @@
 [package]
-name = "itm-tracker"
+name = "live-trader"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 polymarket-core = { path = "../core" }
+polymarket_client_sdk_v2 = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 rustls = { workspace = true }
+chrono = "0.4"
