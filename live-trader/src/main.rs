@@ -59,6 +59,9 @@ struct Entry {
     ask: Decimal,
     offset_s: u64,
     swing_at_entry: Option<Decimal>,
+    /// Multi-venue BTC median at the instant the entry triggered. Compared
+    /// against `final_pyth` at settlement to log how far BTC moved post-entry.
+    btc_at_entry: Option<Decimal>,
     /// Intended share size = round(notional / ask, 2). Set at submit.
     size: Decimal,
     /// Whether we've already sent the Place command for this entry.
@@ -72,11 +75,17 @@ struct Entry {
 }
 
 impl Entry {
-    fn new(ask: Decimal, offset_s: u64, swing_at_entry: Option<Decimal>) -> Self {
+    fn new(
+        ask: Decimal,
+        offset_s: u64,
+        swing_at_entry: Option<Decimal>,
+        btc_at_entry: Option<Decimal>,
+    ) -> Self {
         Entry {
             ask,
             offset_s,
             swing_at_entry,
+            btc_at_entry,
             size: Decimal::ZERO,
             submitted: false,
             order_id: None,
@@ -241,6 +250,7 @@ fn try_trigger(
     max_offset_s: u64,
     direction: Option<&'static str>,
     swing: Option<Decimal>,
+    btc_median: Option<Decimal>,
 ) {
     side.ask = Some(ask);
     if side.entry.is_some() {
@@ -261,7 +271,7 @@ fn try_trigger(
     if direction != Some(side_label) {
         return;
     }
-    side.entry = Some(Entry::new(ask, offset_s, swing));
+    side.entry = Some(Entry::new(ask, offset_s, swing, btc_median));
 }
 
 fn apply_pm(state: &mut State, e: &PolymarketEvent) {
@@ -274,6 +284,7 @@ fn apply_pm(state: &mut State, e: &PolymarketEvent) {
     let max_off = state.max_offset_s;
     let swing_lookback = state.swing_lookback;
     let direction = state.direction();
+    let btc_median = state.btc_median_last();
     let yes_token = state.pm.yes.token_id;
     let no_token = state.pm.no.token_id;
     // Window lock: if either side already has an entry, only update book state
@@ -295,7 +306,7 @@ fn apply_pm(state: &mut State, e: &PolymarketEvent) {
             } else {
                 try_trigger(
                     side, label, a, offset_s, min_ask, max_ask, min_bid, min_off, max_off,
-                    direction, swing,
+                    direction, swing, btc_median,
                 );
             }
         }
@@ -563,6 +574,17 @@ async fn resolve_window(
     });
 }
 
+/// The window's 5-minute period index within the local day: 00:00 local -> 0,
+/// 00:05 -> 1, ... 23:55 -> 287. `window_start_ts` is always 300s-aligned so
+/// this is exact. None only if the timestamp can't be mapped to local time.
+fn period_of_day(window_start_ts: u64) -> Option<u32> {
+    use chrono::{Local, TimeZone, Timelike};
+    Local
+        .timestamp_opt(window_start_ts as i64, 0)
+        .single()
+        .map(|dt| dt.num_seconds_from_midnight() / 300)
+}
+
 fn pnl_per_share(entry_ask: Decimal, win: bool) -> Decimal {
     if win {
         Decimal::ONE - entry_ask
@@ -624,9 +646,9 @@ fn sink_resolved(state: &mut State, r: ResolvedWindow) {
 fn write_header(w: &mut BufWriter<File>) -> Result<()> {
     writeln!(
         w,
-        "window_start_ts,condition_id,side,order_id,intended_ask,size_shares,size_matched,\
-         notional_target,entry_offset_s,swing_at_entry,post_status,post_error,\
-         target_pyth,final_pyth,resolved_side,won,realized_pnl"
+        "window_start_ts,period_of_day,condition_id,side,order_id,intended_ask,size_shares,size_matched,\
+         notional_target,entry_offset_s,swing_at_entry,btc_at_entry,post_status,post_error,\
+         target_pyth,final_pyth,price_diff_from_entry,resolved_side,won,realized_pnl"
     )?;
     w.flush()?;
     Ok(())
@@ -651,6 +673,16 @@ fn write_row(
         .swing_at_entry
         .map(|d| d.to_string())
         .unwrap_or_default();
+    let btc_entry_s = entry
+        .btc_at_entry
+        .map(|d| d.to_string())
+        .unwrap_or_default();
+    // Signed BTC move from entry to settlement (final − entry); blank unless
+    // both the entry-time median and the settlement Pyth price are known.
+    let price_diff_s = match (entry.btc_at_entry, final_pyth) {
+        (Some(entry_px), Some(final_px)) => (final_px - entry_px).to_string(),
+        _ => String::new(),
+    };
     // Keep status/error inside a single CSV field by swapping commas.
     let status_s = entry.status.replace(',', ";");
     let error_s = entry.error.as_deref().unwrap_or("").replace(',', ";");
@@ -658,9 +690,12 @@ fn write_row(
     let final_s = final_pyth.map(|d| d.to_string()).unwrap_or_default();
     let resolved_s = resolved_side.unwrap_or("");
     let won_s = won.map(|b| if b { "1" } else { "0" }).unwrap_or("");
+    let period_s = period_of_day(window_start_ts)
+        .map(|p| p.to_string())
+        .unwrap_or_default();
     writeln!(
         w,
-        "{window_start_ts},{condition_id},{side},{order_id},{},{},{},{notional},{},{swing_s},{status_s},{error_s},{target_s},{final_s},{resolved_s},{won_s},{realized}",
+        "{window_start_ts},{period_s},{condition_id},{side},{order_id},{},{},{},{notional},{},{swing_s},{btc_entry_s},{status_s},{error_s},{target_s},{final_s},{price_diff_s},{resolved_s},{won_s},{realized}",
         entry.ask, entry.size, entry.matched, entry.offset_s,
     )?;
     w.flush()?;
