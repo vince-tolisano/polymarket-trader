@@ -31,7 +31,8 @@
       "Read(//c/Users/vinni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/reqwest-0.12.28/**)",
       "Bash(awk '/^\\\\[\\\\[package\\\\]\\\\]/{p=NR}/^name = \"reqwest\"/&&/0\\\\.13/{print \"block start:\", p; flag=1; next}flag && /^\\\\[\\\\[package\\\\]\\\\]/{exit}flag' C:/Users/vinni/RustroverProjects/polymarket-trader/Cargo.lock)",
       "Bash(awk '{printf \"%d\\\\n\", $1 - \\($1 % 300\\)}')",
-      "PowerShell($c = Join-Path $env:USERPROFILE \".cargo\\\\bin\\\\cargo.exe\"; if \\(Test-Path $c\\) { & $c build -p live-itm 2>&1 | Select-Object -Last 20 } else { \"cargo not at $c\" })"
+      "PowerShell($c = Join-Path $env:USERPROFILE \".cargo\\\\bin\\\\cargo.exe\"; if \\(Test-Path $c\\) { & $c build -p live-itm 2>&1 | Select-Object -Last 20 } else { \"cargo not at $c\" })",
+      "Bash(git ls-tree *)"
     ]
   }
 }

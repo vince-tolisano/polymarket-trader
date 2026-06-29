@@ -10,6 +10,7 @@
       <sourceFolder url="file://$MODULE_DIR$/live-prices/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/testGeo/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/view-prices/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/live-trader/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
       <excludeFolder url="file://$MODULE_DIR$/testGeo/target" />
     </content>

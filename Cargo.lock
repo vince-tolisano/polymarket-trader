@@ -2427,16 +2427,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "itm-tracker"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "polymarket-core",
- "rustls",
- "tokio",
-]
-
-[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2662,6 +2652,18 @@ dependencies = [
  "futures",
  "polymarket-core",
  "ratatui",
+ "rustls",
+ "tokio",
+]
+
+[[package]]
+name = "live-trader"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "polymarket-core",
+ "polymarket_client_sdk_v2",
  "rustls",
  "tokio",
 ]
