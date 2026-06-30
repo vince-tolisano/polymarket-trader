@@ -23,6 +23,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
@@ -532,14 +533,30 @@ async fn fetch_final_pyth_retry(pm: &Polymarket, window_end_ts: u64) -> Option<D
 
 /// Poll the CLOB market until it closes and reports a winner; match the winner
 /// token back to a side. Returns None if it never resolves within the budget.
+///
+/// Polymarket's on-chain winner is the *primary* resolution source, so we poll
+/// it patiently: ~20 minutes (240 * 5s). The CLOB market object persists past
+/// the 5-minute trading window — it stays queryable by `condition_id` — so we
+/// just re-query the same market until the `winner` flag flips after on-chain
+/// resolution lands. The `closed`/`winner` flags routinely lag the window by
+/// several minutes; the old 5-minute budget expired before PM ever reported,
+/// so almost every row resolved via the Pyth last-resort fallback instead. The
+/// resolver runs in its own background task, so a long poll across several
+/// later windows costs nothing but a delayed authoritative row.
 async fn poll_pm_winner(
     pm: &Polymarket,
     condition_id: &str,
     yes_token: U256,
     no_token: U256,
+    cancel: Arc<AtomicBool>,
 ) -> Option<&'static str> {
     tokio::time::sleep(Duration::from_secs(5)).await;
-    for _ in 0..60 {
+    for _ in 0..240 {
+        // On shutdown, stop the patient poll and let the caller fall back to
+        // Pyth immediately rather than blocking exit for up to ~20 minutes.
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
         if let Ok(Some(token_id)) = pm.market_winner(condition_id).await {
             if token_id == yes_token {
                 return Some("YES");
@@ -558,11 +575,12 @@ async fn resolve_window(
     old: OldWindow,
     pm: Arc<Polymarket>,
     tx: mpsc::UnboundedSender<ResolvedWindow>,
+    cancel: Arc<AtomicBool>,
 ) {
     let window_end_ts = old.window_start_ts + WINDOW_SECS;
     let final_pyth = fetch_final_pyth_retry(&pm, window_end_ts).await;
     let pm_winner_side =
-        poll_pm_winner(&pm, &old.condition_id, old.yes_token, old.no_token).await;
+        poll_pm_winner(&pm, &old.condition_id, old.yes_token, old.no_token, cancel).await;
     let _ = tx.send(ResolvedWindow {
         window_start_ts: old.window_start_ts,
         condition_id: old.condition_id,
@@ -1038,6 +1056,9 @@ async fn main() -> Result<()> {
 
     let (resolved_tx, mut resolved_rx) = mpsc::unbounded_channel::<ResolvedWindow>();
     let mut resolver_tasks: Vec<JoinHandle<()>> = Vec::new();
+    // Set on shutdown so patient PM polls bail out and fall back to Pyth
+    // instead of blocking process exit for up to ~20 minutes each.
+    let cancel = Arc::new(AtomicBool::new(false));
 
     let outcome: Result<()> = loop {
         let rollover_in = match next_rollover {
@@ -1077,8 +1098,9 @@ async fn main() -> Result<()> {
                 if let Some(old) = snapshot_window(&state) {
                     let pm_c = pm.clone();
                     let tx_c = resolved_tx.clone();
+                    let cancel_c = Arc::clone(&cancel);
                     resolver_tasks.push(tokio::spawn(async move {
-                        resolve_window(old, pm_c, tx_c).await;
+                        resolve_window(old, pm_c, tx_c, cancel_c).await;
                     }));
                 }
                 match roll_window(&mut state, &tx, &pm, &mut pm_feed, &target_tx, &mut target_fetcher).await {
@@ -1101,13 +1123,17 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Settle + resolve the final in-progress window on shutdown.
+    // Settle + resolve the final in-progress window on shutdown. Signal the
+    // patient PM polls to stop so any in-flight resolvers fall straight back to
+    // Pyth instead of blocking exit for up to ~20 minutes each.
+    cancel.store(true, Ordering::Relaxed);
     settle_orders(&mut state).await;
     if let Some(old) = snapshot_window(&state) {
         let pm_c = pm.clone();
         let tx_c = resolved_tx.clone();
+        let cancel_c = Arc::clone(&cancel);
         resolver_tasks.push(tokio::spawn(async move {
-            resolve_window(old, pm_c, tx_c).await;
+            resolve_window(old, pm_c, tx_c, cancel_c).await;
         }));
     }
     drop(resolved_tx);

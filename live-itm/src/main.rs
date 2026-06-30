@@ -53,10 +53,16 @@ const SWING_BUFFER_RETENTION: Duration = Duration::from_secs(60);
 
 const PM_RESOLUTION_INITIAL_WAIT: Duration = Duration::from_secs(5);
 const PM_RESOLUTION_POLL_INTERVAL: Duration = Duration::from_secs(5);
-/// Up to 5 minutes of polling (60 * 5s) before we give up and fall back
-/// to Pyth in the CSV. Chainlink Data Streams usually settles in <60s but
-/// stalls happen.
-const PM_RESOLUTION_MAX_ATTEMPTS: u32 = 60;
+/// Polymarket's on-chain winner is the *primary* resolution source, so we
+/// poll it patiently: ~20 minutes (240 * 5s) before giving up and falling
+/// back to Pyth as a last resort in the CSV. Chainlink Data Streams usually
+/// settles in <60s, but the CLOB `closed`/`winner` flags routinely lag the
+/// 5-minute window by several minutes; the old 5-minute budget expired before
+/// PM ever reported, so almost every row resolved via the Pyth fallback. The
+/// resolver runs in its own background task, so a long poll across several
+/// subsequent windows costs nothing but a delayed authoritative row (the fast
+/// Pyth *preview* still flips the TUI to a tentative result immediately).
+const PM_RESOLUTION_MAX_ATTEMPTS: u32 = 240;
 
 #[derive(Clone, Copy)]
 struct Entry {
@@ -661,11 +667,14 @@ async fn poll_pm_winner(
     None
 }
 
-/// Two-stage resolution: emit a Pyth-derived preview immediately (so the
-/// TUI scrollback flips from `pending` quickly), then poll PM for the
-/// on-chain winner and emit the authoritative `Final` update that writes
-/// the CSV row and increments counters. If PM polling is exhausted the
-/// `Final` falls back to Pyth.
+/// Two-stage resolution. Polymarket's on-chain winner is the primary,
+/// authoritative source; Pyth is only a last resort. First emit a fast
+/// Pyth-derived *preview* so the TUI scrollback flips from `pending` to a
+/// tentative result quickly (display only — it never writes the CSV). Then
+/// poll PM patiently for the on-chain winner (~20 min, see
+/// `PM_RESOLUTION_MAX_ATTEMPTS`) and emit the authoritative `Final` update
+/// that writes the CSV row and increments counters. Only if PM polling is
+/// fully exhausted does `Final` fall back to the Pyth price.
 async fn resolve_window(
     old: OldWindow,
     pm: Arc<Polymarket>,
