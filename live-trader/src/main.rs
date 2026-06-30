@@ -695,10 +695,11 @@ fn write_row(
         .btc_at_entry
         .map(|d| d.to_string())
         .unwrap_or_default();
-    // Signed BTC move from entry to settlement (final − entry); blank unless
-    // both the entry-time median and the settlement Pyth price are known.
-    let price_diff_s = match (entry.btc_at_entry, final_pyth) {
-        (Some(entry_px), Some(final_px)) => (final_px - entry_px).to_string(),
+    // Signed BTC distance from the window target at entry (entry − target):
+    // how far in-the-money the side already was when it triggered. Blank
+    // unless both the entry-time median and the target are known.
+    let price_diff_s = match (entry.btc_at_entry, target) {
+        (Some(entry_px), Some(target_px)) => (entry_px - target_px).to_string(),
         _ => String::new(),
     };
     // Keep status/error inside a single CSV field by swapping commas.
