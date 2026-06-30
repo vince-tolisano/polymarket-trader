@@ -65,6 +65,10 @@ struct Entry {
     /// BTC median delta over `swing_lookback` at trigger time. `None` if we
     /// didn't have enough history. Negative = BTC fell; positive = rose.
     swing_at_entry: Option<Decimal>,
+    /// Multi-venue BTC median at the instant the entry triggered. `None` if no
+    /// fresh median was available. Used to measure how far BTC moved between
+    /// entry and settlement (`price_diff_from_entry`).
+    btc_at_entry: Option<Decimal>,
 }
 
 struct OutcomeRow {
@@ -300,7 +304,8 @@ impl AppState {
         // Direction confirmation: only enter the side BTC is currently
         // showing. None when target or median is missing — skip the trigger
         // entirely in that case.
-        let direction: Option<&'static str> = match (self.btc_target, self.btc_median_last()) {
+        let btc_median = self.btc_median_last();
+        let direction: Option<&'static str> = match (self.btc_target, btc_median) {
             (Some(t), Some(m)) if m > t.value => Some("YES"),
             (Some(t), Some(m)) if m < t.value => Some("NO "),
             _ => None,
@@ -325,7 +330,7 @@ impl AppState {
                         row.push_ask_sample(now, ask);
                         let swing = row.ask_move_over(swing_lookback);
                         if !window_locked && book_fresh {
-                            try_trigger(row, ask, offset_s, min_ask, max_ask, min_bid, min_off, max_off, direction, swing, window_ts);
+                            try_trigger(row, ask, offset_s, min_ask, max_ask, min_bid, min_off, max_off, direction, swing, btc_median, window_ts);
                         }
                     }
                 }
@@ -342,7 +347,7 @@ impl AppState {
                             row.push_ask_sample(now, ba);
                             let swing = row.ask_move_over(swing_lookback);
                             if !window_locked && book_fresh {
-                                try_trigger(row, ba, offset_s, min_ask, max_ask, min_bid, min_off, max_off, direction, swing, window_ts);
+                                try_trigger(row, ba, offset_s, min_ask, max_ask, min_bid, min_off, max_off, direction, swing, btc_median, window_ts);
                             }
                         }
                         row.last_book_at = Some(now);
@@ -432,6 +437,7 @@ fn try_trigger(
     max_offset_s: u64,
     direction: Option<&'static str>,
     swing: Option<Decimal>,
+    btc_median: Option<Decimal>,
     _window_ts: u64,
 ) {
     if row.entry.is_some() {
@@ -464,6 +470,7 @@ fn try_trigger(
         ask,
         offset_s,
         swing_at_entry: swing,
+        btc_at_entry: btc_median,
     });
 }
 
@@ -707,8 +714,8 @@ fn write_header(w: &mut BufWriter<File>) -> Result<()> {
     writeln!(
         w,
         "window_start_ts,condition_id,side,entry_ask,entry_offset_s,\
-         swing_at_entry,entered_on_down_swing,\
-         target_pyth,final_pyth,resolved_side,resolved_source,won,pnl"
+         swing_at_entry,entered_on_down_swing,btc_at_entry,\
+         target_pyth,final_pyth,price_diff_from_entry,resolved_side,resolved_source,won,pnl"
     )?;
     w.flush()?;
     Ok(())
@@ -746,10 +753,17 @@ fn write_row(
     let down_s = entered_on_down_swing(entry.swing_at_entry)
         .map(|b| if b { "1" } else { "0" })
         .unwrap_or("");
+    let btc_entry_s = entry.btc_at_entry.map(|d| d.to_string()).unwrap_or_default();
+    // Signed BTC move from entry to settlement (final − entry); blank unless
+    // both the entry-time median and the settlement Pyth price are known.
+    let price_diff_s = match (entry.btc_at_entry, final_pyth) {
+        (Some(entry_px), Some(final_px)) => (final_px - entry_px).to_string(),
+        _ => String::new(),
+    };
     let side_trim = side.trim();
     writeln!(
         w,
-        "{window_start_ts},{condition_id},{side_trim},{},{},{swing_s},{down_s},{target_s},{final_s},{resolved_s},{resolved_source},{won_s},{pnl_s}",
+        "{window_start_ts},{condition_id},{side_trim},{},{},{swing_s},{down_s},{btc_entry_s},{target_s},{final_s},{price_diff_s},{resolved_s},{resolved_source},{won_s},{pnl_s}",
         entry.ask, entry.offset_s,
     )?;
     w.flush()?;
