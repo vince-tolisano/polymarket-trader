@@ -1,0 +1,21 @@
+# Keep the build context small and reproducible. Cargo.lock + sources ARE
+# needed (do not ignore them).
+target/
+data/
+.git/
+.idea/
+.claude/
+**/*.rs.bk
+*.pdb
+**/mutants.out*/
+
+# Docker + local secrets — never send these into the build context.
+Dockerfile
+.dockerignore
+docker-compose.yml
+.env
+.env.*
+!.env.example
+
+# Project doc (git-ignored anyway); not needed to build.
+CLAUDE.md

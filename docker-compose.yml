@@ -1,0 +1,34 @@
+# Convenience wrapper for the containerized live-trader.
+#
+#   Build:        docker compose build
+#   Dry-run:      docker compose up          (default command below is --dry-run)
+#   GO LIVE:      docker compose run --rm live-trader        (no --dry-run → real orders)
+#     or edit `command:` below to drop --dry-run for `up`.
+#
+# The private key is supplied at runtime via the environment (a local .env file
+# holding POLY_PRIVATE_KEY, or your shell). It is never written into the image.
+
+services:
+  live-trader:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: polymarket-live-trader
+    # Fail fast if the key isn't provided (dry-run doesn't need it, but this
+    # keeps the two paths symmetric — remove the `:?...` to make it optional).
+    environment:
+      POLY_PRIVATE_KEY: ${POLY_PRIVATE_KEY:-}
+      TZ: ${TZ:-UTC}
+    # CSVs land in ./data on the host (Docker Desktop bind mounts ignore the
+    # container uid, so writes work regardless of ownership).
+    volumes:
+      - ./data:/app/data
+    # SAFE DEFAULT: dry-run (no wallet, no posting). Remove --dry-run — or use
+    # `docker compose run --rm live-trader` with your own flags — to trade live.
+    # Add strategy flags here too, e.g. --notional 5 --min-target-dist 35.
+    command: ["--dry-run"]
+    # Give the graceful SIGINT shutdown room to settle/cancel orders, resolve
+    # the final window, and flush the CSV before the container is killed.
+    stop_grace_period: 30s
+    init: true
+    restart: unless-stopped

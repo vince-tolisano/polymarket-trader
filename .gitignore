@@ -22,3 +22,8 @@ data
 
 CLAUDE.md
 test-geo
+
+# Local secrets for the containerized live-trader (holds POLY_PRIVATE_KEY)
+.env
+.env.*
+!.env.example

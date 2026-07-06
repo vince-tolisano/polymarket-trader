@@ -174,6 +174,9 @@ struct State {
     min_ask: Decimal,
     max_ask: Decimal,
     min_bid: Decimal,
+    /// Minimum absolute BTC distance (USD) between the median and the target
+    /// required to enter — filters out marginal entries sitting on the strike.
+    min_target_dist: Decimal,
     min_offset_s: u64,
     max_offset_s: u64,
     swing_lookback: Duration,
@@ -252,6 +255,8 @@ fn try_trigger(
     direction: Option<&'static str>,
     swing: Option<Decimal>,
     btc_median: Option<Decimal>,
+    target: Option<Decimal>,
+    min_target_dist: Decimal,
 ) {
     side.ask = Some(ask);
     if side.entry.is_some() {
@@ -260,7 +265,8 @@ fn try_trigger(
     if offset_s < min_offset_s || offset_s >= max_offset_s {
         return;
     }
-    if ask < min_ask || ask > max_ask {
+    // Ask band is (min_ask, max_ask]: exclude min_ask itself, include max_ask.
+    if ask <= min_ask || ask > max_ask {
         return;
     }
     let Some(bid) = side.bid else {
@@ -271,6 +277,13 @@ fn try_trigger(
     }
     if direction != Some(side_label) {
         return;
+    }
+    // Minimum distance past the strike: BTC must be at least `min_target_dist`
+    // (USD) away from the target, filtering out marginal entries sitting right
+    // on the strike where a tiny reversal flips the outcome.
+    match (btc_median, target) {
+        (Some(m), Some(t)) if (m - t).abs() >= min_target_dist => {}
+        _ => return,
     }
     side.entry = Some(Entry::new(ask, offset_s, swing, btc_median));
 }
@@ -286,6 +299,8 @@ fn apply_pm(state: &mut State, e: &PolymarketEvent) {
     let swing_lookback = state.swing_lookback;
     let direction = state.direction();
     let btc_median = state.btc_median_last();
+    let target_val = state.btc_target.map(|t| t.value);
+    let min_target_dist = state.min_target_dist;
     let yes_token = state.pm.yes.token_id;
     let no_token = state.pm.no.token_id;
     // Window lock: if either side already has an entry, only update book state
@@ -307,7 +322,7 @@ fn apply_pm(state: &mut State, e: &PolymarketEvent) {
             } else {
                 try_trigger(
                     side, label, a, offset_s, min_ask, max_ask, min_bid, min_off, max_off,
-                    direction, swing, btc_median,
+                    direction, swing, btc_median, target_val, min_target_dist,
                 );
             }
         }
@@ -845,6 +860,7 @@ struct Args {
     min_ask: Decimal,
     max_ask: Decimal,
     min_bid: Decimal,
+    min_target_dist: Decimal,
     min_offset_s: u64,
     max_offset_s: u64,
     swing_lookback_s: u64,
@@ -863,6 +879,7 @@ fn parse_args() -> Result<Args> {
         min_ask: Decimal::new(95, 2),
         max_ask: Decimal::new(99, 2),
         min_bid: Decimal::new(50, 2),
+        min_target_dist: Decimal::from(35),
         min_offset_s: 240,
         max_offset_s: WINDOW_SECS - 10,
         swing_lookback_s: 10,
@@ -893,6 +910,11 @@ fn parse_args() -> Result<Args> {
             "--min-bid" => {
                 let v = args.next().context("--min-bid needs a value")?;
                 a.min_bid = v.parse().with_context(|| format!("parsing --min-bid {v}"))?;
+            }
+            "--min-target-dist" => {
+                let v = args.next().context("--min-target-dist needs a value")?;
+                a.min_target_dist =
+                    v.parse().with_context(|| format!("parsing --min-target-dist {v}"))?;
             }
             "--min-offset" => {
                 let v = args.next().context("--min-offset needs a value")?;
@@ -1040,6 +1062,7 @@ async fn main() -> Result<()> {
         min_ask: args.min_ask,
         max_ask: args.max_ask,
         min_bid: args.min_bid,
+        min_target_dist: args.min_target_dist,
         min_offset_s: args.min_offset_s,
         max_offset_s: args.max_offset_s,
         swing_lookback: Duration::from_secs(args.swing_lookback_s),

@@ -189,6 +189,9 @@ struct AppState {
     min_ask: Decimal,
     max_ask: Decimal,
     min_bid: Decimal,
+    /// Minimum absolute BTC distance (USD) between the median and the target
+    /// required to enter — filters out marginal entries sitting on the strike.
+    min_target_dist: Decimal,
     min_offset_s: u64,
     max_offset_s: u64,
     swing_lookback: Duration,
@@ -311,6 +314,8 @@ impl AppState {
         // showing. None when target or median is missing — skip the trigger
         // entirely in that case.
         let btc_median = self.btc_median_last();
+        let target_val = self.btc_target.map(|t| t.value);
+        let min_target_dist = self.min_target_dist;
         let direction: Option<&'static str> = match (self.btc_target, btc_median) {
             (Some(t), Some(m)) if m > t.value => Some("YES"),
             (Some(t), Some(m)) if m < t.value => Some("NO "),
@@ -336,7 +341,7 @@ impl AppState {
                         row.push_ask_sample(now, ask);
                         let swing = row.ask_move_over(swing_lookback);
                         if !window_locked && book_fresh {
-                            try_trigger(row, ask, offset_s, min_ask, max_ask, min_bid, min_off, max_off, direction, swing, btc_median, window_ts);
+                            try_trigger(row, ask, offset_s, min_ask, max_ask, min_bid, min_off, max_off, direction, swing, btc_median, target_val, min_target_dist, window_ts);
                         }
                     }
                 }
@@ -353,7 +358,7 @@ impl AppState {
                             row.push_ask_sample(now, ba);
                             let swing = row.ask_move_over(swing_lookback);
                             if !window_locked && book_fresh {
-                                try_trigger(row, ba, offset_s, min_ask, max_ask, min_bid, min_off, max_off, direction, swing, btc_median, window_ts);
+                                try_trigger(row, ba, offset_s, min_ask, max_ask, min_bid, min_off, max_off, direction, swing, btc_median, target_val, min_target_dist, window_ts);
                             }
                         }
                         row.last_book_at = Some(now);
@@ -444,6 +449,8 @@ fn try_trigger(
     direction: Option<&'static str>,
     swing: Option<Decimal>,
     btc_median: Option<Decimal>,
+    target: Option<Decimal>,
+    min_target_dist: Decimal,
     _window_ts: u64,
 ) {
     if row.entry.is_some() {
@@ -455,7 +462,8 @@ fn try_trigger(
     if offset_s < min_offset_s || offset_s >= max_offset_s {
         return;
     }
-    if ask < min_ask || ask > max_ask {
+    // Ask band is (min_ask, max_ask]: exclude min_ask itself, include max_ask.
+    if ask <= min_ask || ask > max_ask {
         return;
     }
     // Require the bid to also be high: filters out wide-spread thin books
@@ -471,6 +479,13 @@ fn try_trigger(
     // unknown (no target or median yet) we skip rather than guess.
     if direction != Some(row.side) {
         return;
+    }
+    // Minimum distance past the strike: BTC must be at least `min_target_dist`
+    // (USD) away from the target, filtering out marginal entries sitting right
+    // on the strike where a tiny reversal flips the outcome.
+    match (btc_median, target) {
+        (Some(m), Some(t)) if (m - t).abs() >= min_target_dist => {}
+        _ => return,
     }
     row.entry = Some(Entry {
         ask,
@@ -901,6 +916,7 @@ async fn main() -> Result<()> {
     let mut min_ask = Decimal::new(95, 2);
     let mut max_ask = Decimal::new(99, 2);
     let mut min_bid = Decimal::new(50, 2);
+    let mut min_target_dist = Decimal::from(35);
     let mut min_offset_s: u64 = 240;
     let mut max_offset_s: u64 = WINDOW_SECS - 10;
     let mut swing_lookback_s: u64 = 10;
@@ -922,6 +938,12 @@ async fn main() -> Result<()> {
             "--min-bid" => {
                 let v = args.next().context("--min-bid needs a value")?;
                 min_bid = v.parse().with_context(|| format!("parsing --min-bid {v}"))?;
+            }
+            "--min-target-dist" => {
+                let v = args.next().context("--min-target-dist needs a value")?;
+                min_target_dist = v
+                    .parse()
+                    .with_context(|| format!("parsing --min-target-dist {v}"))?;
             }
             "--min-offset" => {
                 let v = args.next().context("--min-offset needs a value")?;
@@ -996,6 +1018,7 @@ async fn main() -> Result<()> {
         min_ask,
         max_ask,
         min_bid,
+        min_target_dist,
         min_offset_s,
         max_offset_s,
         swing_lookback: Duration::from_secs(swing_lookback_s),
