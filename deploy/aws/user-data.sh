@@ -8,7 +8,8 @@
 #   2. Adds swap (Rust release builds OOM on small instances).
 #   3. Clones this repo and builds the image ON the instance (arch auto-matches,
 #      so a Graviton/arm64 box just works).
-#   4. Pulls POLY_PRIVATE_KEY from SSM Parameter Store (SecureString) into .env.
+#   4. Pulls POLY_PRIVATE_KEY from SSM (SecureString) and writes the public
+#      POLY_FUNDER / POLY_SIG_TYPE config values into .env.
 #   5. Installs a systemd unit so the bot starts on boot and stops GRACEFULLY
 #      (SIGINT + 30s) on shutdown, so it can settle/cancel orders and flush CSVs.
 #
@@ -29,6 +30,15 @@ REPO_URL="https://github.com/vince-tolisano/polymarket-trader.git"
 BRANCH="main"
 APP_DIR="/opt/polymarket-trader"
 TZ_VALUE="America/New_York"
+# Polymarket funder wallet address (public, constant — NOT a secret, NOT the key).
+# This is the address that HOLDS your funds/positions (your profile/proxy wallet),
+# which can differ from the deposit-screen address (that may just be a routing
+# address). Leave empty if your account has no proxy (signing wallet is the funder).
+POLY_FUNDER_VALUE="0x8E6EC1105660f1327c536aDBf3437324313B677b"
+# CLOB signature type matching the funder wallet: 0=EOA, 1=Proxy(email/magic),
+# 2=GnosisSafe(browser-wallet proxy e.g. Phantom), 3=Poly1271(deposit wallet).
+# Set 2 or 3 whenever POLY_FUNDER_VALUE is a proxy, else live orders are rejected.
+POLY_SIG_TYPE_VALUE="2"
 
 export AWS_DEFAULT_REGION="$AWS_REGION"
 
@@ -76,6 +86,8 @@ POLY_KEY="$(aws ssm get-parameter --name "$SSM_KEY_PARAM" --with-decryption \
 umask 077
 cat > "$APP_DIR/.env" <<EOF
 POLY_PRIVATE_KEY=${POLY_KEY}
+POLY_FUNDER=${POLY_FUNDER_VALUE}
+POLY_SIG_TYPE=${POLY_SIG_TYPE_VALUE}
 TZ=${TZ_VALUE}
 EOF
 unset POLY_KEY GH_TOKEN

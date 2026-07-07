@@ -18,6 +18,14 @@ services:
     # keeps the two paths symmetric — remove the `:?...` to make it optional).
     environment:
       POLY_PRIVATE_KEY: ${POLY_PRIVATE_KEY:-}
+      # Polymarket proxy wallet address (public, constant). Signing is done by
+      # POLY_PRIVATE_KEY; funds/positions live in this proxy. Leave blank if your
+      # account has no proxy (signing wallet is the funder).
+      POLY_FUNDER: ${POLY_FUNDER:-}
+      # CLOB signature type matching the funder wallet: 0=EOA, 1=Proxy(email/magic),
+      # 2=GnosisSafe(browser-wallet proxy e.g. Phantom), 3=Poly1271(deposit wallet).
+      # Must be set (2 or 3) whenever POLY_FUNDER is a proxy, or orders get rejected.
+      POLY_SIG_TYPE: ${POLY_SIG_TYPE:-}
       TZ: ${TZ:-UTC}
     # CSVs land in ./data on the host (Docker Desktop bind mounts ignore the
     # container uid, so writes work regardless of ownership).

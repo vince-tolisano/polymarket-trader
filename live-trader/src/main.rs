@@ -869,6 +869,9 @@ struct Args {
     host: String,
     chain_id: u64,
     funder: Option<String>,
+    /// CLOB signature type (0=EOA, 1=Proxy, 2=GnosisSafe, 3=Poly1271). `None`
+    /// until set by `--signature-type` or `$POLY_SIG_TYPE`; falls back to 0.
+    signature_type: Option<u8>,
     dry_run: bool,
 }
 
@@ -880,7 +883,7 @@ fn parse_args() -> Result<Args> {
         min_ask: Decimal::new(95, 2),
         max_ask: Decimal::new(99, 2),
         min_bid: Decimal::new(50, 2),
-        min_target_dist: Decimal::from(35),
+        min_target_dist: Decimal::from(16),
         min_offset_s: 240,
         max_offset_s: WINDOW_SECS - 10,
         swing_lookback_s: 10,
@@ -888,6 +891,7 @@ fn parse_args() -> Result<Args> {
         host: DEFAULT_CLOB_HOST.to_string(),
         chain_id: POLYGON_CHAIN_ID,
         funder: None,
+        signature_type: None,
         dry_run: false,
     };
     let mut args = std::env::args().skip(1);
@@ -943,6 +947,12 @@ fn parse_args() -> Result<Args> {
             "--funder" => {
                 a.funder = Some(args.next().context("--funder needs an address")?);
             }
+            "--signature-type" => {
+                let v = args.next().context("--signature-type needs a value (0-3)")?;
+                let n: u8 = v.parse().with_context(|| format!("parsing --signature-type {v}"))?;
+                anyhow::ensure!(n <= 3, "--signature-type must be 0-3, got {n}");
+                a.signature_type = Some(n);
+            }
             "--dry-run" => a.dry_run = true,
             other => {
                 if a.explicit_market.is_none() {
@@ -960,8 +970,34 @@ fn parse_args() -> Result<Args> {
 async fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let args = parse_args()?;
+    let mut args = parse_args()?;
     let auto_roll = args.explicit_market.is_none();
+
+    // The funder (Polymarket proxy/email wallet) is a fixed, public address, so
+    // unlike the private key it can live in config. Fall back to $POLY_FUNDER when
+    // --funder isn't passed; the CLI flag still wins for one-off overrides.
+    if args.funder.is_none() {
+        if let Ok(funder) = std::env::var("POLY_FUNDER") {
+            if !funder.trim().is_empty() {
+                args.funder = Some(funder);
+            }
+        }
+    }
+
+    // Same treatment for the signature type, which must match the funder's wallet
+    // kind (2 = GnosisSafe/browser-wallet proxy like Phantom, 3 = deposit wallet).
+    if args.signature_type.is_none() {
+        if let Ok(v) = std::env::var("POLY_SIG_TYPE") {
+            let v = v.trim();
+            if !v.is_empty() {
+                let n: u8 = v
+                    .parse()
+                    .with_context(|| format!("parsing $POLY_SIG_TYPE {v}"))?;
+                anyhow::ensure!(n <= 3, "$POLY_SIG_TYPE must be 0-3, got {n}");
+                args.signature_type = Some(n);
+            }
+        }
+    }
 
     // Read the private key from the environment (never the command line) unless
     // dry-running, in which case no wallet is needed.
@@ -1002,6 +1038,19 @@ async fn main() -> Result<()> {
     );
     if !args.dry_run {
         eprintln!("!!! LIVE: real GTC limit BUY orders will be posted to Polymarket !!!");
+        match &args.funder {
+            Some(f) => eprintln!("funder (proxy wallet): {f}"),
+            None => eprintln!("funder: none (signing wallet is the funder)"),
+        }
+        let st = args.signature_type.unwrap_or(0);
+        let st_name = match st {
+            0 => "EOA",
+            1 => "Proxy (email/magic)",
+            2 => "GnosisSafe (browser-wallet proxy)",
+            3 => "Poly1271 (deposit wallet)",
+            _ => "?",
+        };
+        eprintln!("signature type: {st} ({st_name})");
     }
 
     // Bring up the executor and wait for authentication before trading.
@@ -1010,6 +1059,7 @@ async fn main() -> Result<()> {
         private_key,
         chain_id: args.chain_id,
         funder: args.funder.clone(),
+        signature_type: args.signature_type.unwrap_or(0),
         dry_run: args.dry_run,
     });
     match ready_rx.await {

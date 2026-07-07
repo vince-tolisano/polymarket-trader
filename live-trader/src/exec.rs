@@ -12,7 +12,7 @@ use std::str::FromStr;
 
 use anyhow::Result;
 use polymarket_client_sdk_v2::auth::LocalSigner;
-use polymarket_client_sdk_v2::clob::types::{OrderType, Side};
+use polymarket_client_sdk_v2::clob::types::{OrderType, Side, SignatureType};
 use polymarket_client_sdk_v2::clob::{Client, Config};
 use polymarket_core::{Decimal, U256};
 use tokio::sync::{mpsc, oneshot};
@@ -29,6 +29,12 @@ pub struct ExecConfig {
     /// Optional proxy/funder address for Polymarket email/magic wallets. For a
     /// plain EOA wallet leave this `None`.
     pub funder: Option<String>,
+    /// How the CLOB should verify signatures, matching the wallet type that owns
+    /// the funds: 0 = EOA, 1 = Proxy (email/magic), 2 = GnosisSafe (browser-wallet
+    /// proxy, e.g. Phantom/MetaMask), 3 = Poly1271 (EIP-1271 deposit wallet).
+    /// Defaults to 0. Setting a non-zero type without the matching `funder` will
+    /// be rejected by the CLOB.
+    pub signature_type: u8,
     /// When true, never authenticate or post — `Place` just acks. Lets you run
     /// the full strategy against the live book without spending anything.
     pub dry_run: bool,
@@ -136,6 +142,19 @@ async fn run_executor(
             }
         }
     }
+    let sig_type = match cfg.signature_type {
+        0 => SignatureType::Eoa,
+        1 => SignatureType::Proxy,
+        2 => SignatureType::GnosisSafe,
+        3 => SignatureType::Poly1271,
+        other => {
+            let _ = ready_tx.send(Err(format!(
+                "invalid signature type {other} (expected 0=EOA, 1=Proxy, 2=GnosisSafe, 3=Poly1271)"
+            )));
+            return;
+        }
+    };
+    auth_builder = auth_builder.signature_type(sig_type);
     let client = match auth_builder.authenticate().await {
         Ok(c) => c,
         Err(e) => {
