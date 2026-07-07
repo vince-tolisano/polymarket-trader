@@ -21,11 +21,13 @@ COPY . .
 
 # BuildKit cache mounts keep the crates.io registry and the target/ dir warm
 # across rebuilds. The binary lives inside the target/ cache mount, so it must
-# be copied out to a real image path within the same RUN step. --locked builds
-# exactly what Cargo.lock pins.
+# be copied out to a real image path within the same RUN step.
+# NOTE: --locked was dropped temporarily so cargo can update Cargo.lock for the
+# SDK 0.5 -> 0.6 bump (no local cargo to regenerate the lock). Restore --locked
+# once an updated Cargo.lock is committed.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --locked --release -p live-trader \
+    cargo build --release -p live-trader \
     && cp target/release/live-trader /usr/local/bin/live-trader
 
 # ---- Runtime -------------------------------------------------------------
