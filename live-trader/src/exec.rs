@@ -11,7 +11,9 @@
 use std::str::FromStr;
 
 use anyhow::Result;
-use polymarket_client_sdk_v2::auth::LocalSigner;
+// `Signer` brings the `with_chain_id`/`address` trait methods into scope (they
+// moved behind the trait in the alloy-signer bump that came with rustc 1.91).
+use polymarket_client_sdk_v2::auth::{LocalSigner, Signer};
 use polymarket_client_sdk_v2::clob::types::{OrderType, Side, SignatureType};
 use polymarket_client_sdk_v2::clob::{Client, Config};
 use polymarket_core::{Decimal, U256};
