@@ -26,6 +26,12 @@ services:
       # 2=GnosisSafe(browser-wallet proxy e.g. Phantom), 3=Poly1271(deposit wallet).
       # Must be set (2 or 3) whenever POLY_FUNDER is a proxy, or orders get rejected.
       POLY_SIG_TYPE: ${POLY_SIG_TYPE:-}
+      # Pre-issued CLOB API creds (Polymarket "API keys" screen). Set all three to
+      # inject them directly, bypassing the EOA-bound key derivation that breaks
+      # the deposit-wallet/Poly1271 flow. Leave blank to derive from the signer.
+      POLY_API_KEY: ${POLY_API_KEY:-}
+      POLY_API_SECRET: ${POLY_API_SECRET:-}
+      POLY_API_PASSPHRASE: ${POLY_API_PASSPHRASE:-}
       TZ: ${TZ:-UTC}
     # CSVs land in ./data on the host (Docker Desktop bind mounts ignore the
     # container uid, so writes work regardless of ownership).

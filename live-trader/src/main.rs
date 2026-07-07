@@ -999,6 +999,19 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Optional pre-issued CLOB API credentials (Polymarket "API keys" screen).
+    // When all three are set they're injected as-is, bypassing the SDK's
+    // EOA-bound key derivation — required for deposit-wallet/Poly1271 accounts.
+    let nonempty = |name: &str| std::env::var(name).ok().filter(|s| !s.trim().is_empty());
+    let api_creds = match (
+        nonempty("POLY_API_KEY"),
+        nonempty("POLY_API_SECRET"),
+        nonempty("POLY_API_PASSPHRASE"),
+    ) {
+        (Some(k), Some(s), Some(p)) => Some((k, s, p)),
+        _ => None,
+    };
+
     // Read the private key from the environment (never the command line) unless
     // dry-running, in which case no wallet is needed.
     let private_key = if args.dry_run {
@@ -1051,6 +1064,11 @@ async fn main() -> Result<()> {
             _ => "?",
         };
         eprintln!("signature type: {st} ({st_name})");
+        if api_creds.is_some() {
+            eprintln!("API credentials: injected from POLY_API_KEY/SECRET/PASSPHRASE");
+        } else {
+            eprintln!("API credentials: deriving from signer (no POLY_API_* set)");
+        }
     }
 
     // Bring up the executor and wait for authentication before trading.
@@ -1060,6 +1078,7 @@ async fn main() -> Result<()> {
         chain_id: args.chain_id,
         funder: args.funder.clone(),
         signature_type: args.signature_type.unwrap_or(0),
+        api_creds,
         dry_run: args.dry_run,
     });
     match ready_rx.await {

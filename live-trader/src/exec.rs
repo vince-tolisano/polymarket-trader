@@ -13,7 +13,7 @@ use std::str::FromStr;
 use anyhow::Result;
 // `Signer` brings the `with_chain_id`/`address` trait methods into scope (they
 // moved behind the trait in the alloy-signer bump that came with rustc 1.91).
-use polymarket_client_sdk_v2::auth::{LocalSigner, Signer};
+use polymarket_client_sdk_v2::auth::{Credentials, LocalSigner, Signer};
 use polymarket_client_sdk_v2::clob::types::{OrderType, Side, SignatureType};
 use polymarket_client_sdk_v2::clob::{Client, Config};
 use polymarket_core::{Decimal, U256};
@@ -37,6 +37,11 @@ pub struct ExecConfig {
     /// Defaults to 0. Setting a non-zero type without the matching `funder` will
     /// be rejected by the CLOB.
     pub signature_type: u8,
+    /// Optional pre-issued CLOB API credentials `(key, secret, passphrase)` from
+    /// Polymarket's "API keys" screen. When present they are injected directly,
+    /// bypassing the SDK's L1-derive step (which binds the key to the EOA and
+    /// breaks the deposit-wallet/Poly1271 flow). Leave `None` to derive.
+    pub api_creds: Option<(String, String, String)>,
     /// When true, never authenticate or post — `Place` just acks. Lets you run
     /// the full strategy against the live book without spending anything.
     pub dry_run: bool,
@@ -157,6 +162,23 @@ async fn run_executor(
         }
     };
     auth_builder = auth_builder.signature_type(sig_type);
+    // Inject pre-issued API credentials when supplied, so the SDK uses them as-is
+    // instead of deriving a fresh key bound to the EOA signer. Deserialized via
+    // serde (the fields are crate-private) using the API's JSON field names.
+    if let Some((key, secret, passphrase)) = &cfg.api_creds {
+        let value = serde_json::json!({
+            "apiKey": key,
+            "secret": secret,
+            "passphrase": passphrase,
+        });
+        match serde_json::from_value::<Credentials>(value) {
+            Ok(creds) => auth_builder = auth_builder.credentials(creds),
+            Err(e) => {
+                let _ = ready_tx.send(Err(format!("building injected API credentials: {e}")));
+                return;
+            }
+        }
+    }
     let client = match auth_builder.authenticate().await {
         Ok(c) => c,
         Err(e) => {

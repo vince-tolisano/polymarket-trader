@@ -2665,6 +2665,7 @@ dependencies = [
  "polymarket-core",
  "polymarket_client_sdk_v2",
  "rustls",
+ "serde_json",
  "tokio",
 ]
 
