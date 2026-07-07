@@ -61,7 +61,8 @@ struct Entry {
     offset_s: u64,
     swing_at_entry: Option<Decimal>,
     /// Multi-venue BTC median at the instant the entry triggered. Compared
-    /// against `final_pyth` at settlement to log how far BTC moved post-entry.
+    /// against the window target to log how far in-the-money the side already
+    /// was at entry (`price_diff_from_entry` = entry − target).
     btc_at_entry: Option<Decimal>,
     /// Intended share size = round(notional / ask, 2). Set at submit.
     size: Decimal,
@@ -1075,7 +1076,7 @@ async fn main() -> Result<()> {
 
     let mut next_rollover: Option<Instant> =
         if auto_roll { Some(next_window_boundary()?) } else { None };
-    let mut summary_tick = tokio::time::interval(Duration::from_secs(30));
+    let mut summary_tick = tokio::time::interval(Duration::from_secs(300));
     summary_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let (resolved_tx, mut resolved_rx) = mpsc::unbounded_channel::<ResolvedWindow>();

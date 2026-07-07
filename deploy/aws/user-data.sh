@@ -26,7 +26,7 @@ SSM_KEY_PARAM="/polymarket-trader/POLY_PRIVATE_KEY"
 # Leave as-is; if the param doesn't exist the script falls back to anon clone.
 SSM_GH_TOKEN_PARAM="/polymarket-trader/GITHUB_TOKEN"
 REPO_URL="https://github.com/vince-tolisano/polymarket-trader.git"
-BRANCH="Data"
+BRANCH="main"
 APP_DIR="/opt/polymarket-trader"
 TZ_VALUE="America/New_York"
 
