@@ -11,8 +11,10 @@
 
 # ---- Builder -------------------------------------------------------------
 # Full (non-slim) image: buildpack-deps base ships gcc/make so ring compiles.
-# Pinned toolchain ≥ 1.85 for edition 2024.
-FROM rust:1.88-bookworm AS builder
+# Toolchain floor is dependency-driven: alloy/ruint in Cargo.lock require rustc
+# >= 1.91 (edition 2024 itself only needs >= 1.85). Bump this if the lock drifts
+# to deps needing a newer rustc — the failure is a clear "not supported by" list.
+FROM rust:1.91-bookworm AS builder
 
 WORKDIR /src
 COPY . .
