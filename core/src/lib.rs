@@ -118,17 +118,23 @@ impl Polymarket {
 
     /// Fetch Pyth Network's BTC/USD aggregate price at a specific unix
     /// timestamp (seconds). Hermes returns the update closest to the requested
-    /// time. Returns Ok(None) if no parsed update was returned.
+    /// time. Returns Ok(None) if Hermes has no update for that timestamp yet
+    /// (it 404s on boundary-aligned very-recent timestamps) or no parsed
+    /// update was returned.
     pub async fn pyth_btc_usd_at(&self, ts: u64) -> Result<Option<Decimal>> {
         let url = format!(
             "{PYTH_HERMES_HOST}/v2/updates/price/{ts}?ids[]={PYTH_BTC_USD_FEED_ID}"
         );
-        let updates: PythUpdates = self
+        let resp = self
             .pm_proxy
             .get(&url)
             .send()
             .await
-            .with_context(|| format!("GET {url}"))?
+            .with_context(|| format!("GET {url}"))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let updates: PythUpdates = resp
             .error_for_status()
             .with_context(|| format!("status from {url}"))?
             .json()

@@ -776,6 +776,11 @@ fn spawn_target_fetcher(
     tx: mpsc::UnboundedSender<TargetMsg>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // Retry quietly: Hermes routinely has no update yet for a
+        // boundary-aligned window-start ts, so per-attempt misses aren't worth
+        // a log line. Warn once only if every attempt fails (the median
+        // fallback then seeds the target).
+        let mut last_reason = String::new();
         for attempt in 1..=TARGET_FETCH_RETRIES {
             if attempt > 1 {
                 tokio::time::sleep(TARGET_FETCH_BACKOFF).await;
@@ -785,18 +790,13 @@ fn spawn_target_fetcher(
                     let _ = tx.send(Ok(v));
                     return;
                 }
-                Ok(None) => {
-                    let _ = tx.send(Err(format!(
-                        "px target [{attempt}/{TARGET_FETCH_RETRIES}]: pyth had no update"
-                    )));
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(format!(
-                        "px target [{attempt}/{TARGET_FETCH_RETRIES}]: {e:#}"
-                    )));
-                }
+                Ok(None) => last_reason = "pyth had no update yet".to_string(),
+                Err(e) => last_reason = format!("{e:#}"),
             }
         }
+        let _ = tx.send(Err(format!(
+            "px target unavailable after {TARGET_FETCH_RETRIES} attempts ({last_reason}); using median fallback"
+        )));
     })
 }
 
@@ -1145,8 +1145,6 @@ async fn main() -> Result<()> {
 
     let mut next_rollover: Option<Instant> =
         if auto_roll { Some(next_window_boundary()?) } else { None };
-    let mut summary_tick = tokio::time::interval(Duration::from_secs(300));
-    summary_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let (resolved_tx, mut resolved_rx) = mpsc::unbounded_channel::<ResolvedWindow>();
     let mut resolver_tasks: Vec<JoinHandle<()>> = Vec::new();
@@ -1178,7 +1176,10 @@ async fn main() -> Result<()> {
                 // Post any freshly-captured entry.
                 submit_pending(&mut state).await;
             }
-            Some(r) = resolved_rx.recv() => sink_resolved(&mut state, r),
+            Some(r) = resolved_rx.recv() => {
+                sink_resolved(&mut state, r);
+                print_summary(&state);
+            }
             Some(msg) = target_rx.recv() => {
                 match msg {
                     Ok(value) => state.btc_target = Some(Target { value }),
@@ -1201,6 +1202,7 @@ async fn main() -> Result<()> {
                     Ok(()) => {
                         next_rollover = next_window_boundary().ok();
                         eprintln!("rollover: now trading {}", state.pm.condition_id);
+                        print_summary(&state);
                     }
                     Err(e) => {
                         eprintln!("WARN: rollover failed: {e:#}");
@@ -1209,7 +1211,6 @@ async fn main() -> Result<()> {
                 }
                 while target_rx.try_recv().is_ok() {}
             }
-            _ = summary_tick.tick() => print_summary(&state),
             _ = signal::ctrl_c() => {
                 eprintln!("\nshutting down…");
                 break Ok(());
