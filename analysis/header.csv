@@ -1,0 +1,1 @@
+window_start_ts,period_of_day,condition_id,side,order_id,intended_ask,size_shares,size_matched,notional_target,entry_offset_s,swing_at_entry,btc_at_entry,post_status,post_error,target_pyth,final_pyth,price_diff_from_entry,resolved_side,won,realized_pnl

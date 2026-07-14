@@ -883,7 +883,7 @@ fn parse_args() -> Result<Args> {
         min_ask: Decimal::new(95, 2),
         max_ask: Decimal::new(99, 2),
         min_bid: Decimal::new(50, 2),
-        min_target_dist: Decimal::from(16),
+        min_target_dist: Decimal::from(45),
         min_offset_s: 240,
         max_offset_s: WINDOW_SECS - 10,
         swing_lookback_s: 10,
