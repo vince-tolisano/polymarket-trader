@@ -40,7 +40,7 @@ services:
     # SAFE DEFAULT: dry-run (no wallet, no posting). Remove --dry-run — or use
     # `docker compose run --rm live-trader` with your own flags — to trade live.
     # Add strategy flags here too, e.g. --notional 5 --min-target-dist 35.
-    command: ["--notional" "1"]
+    command: ["--notional", "1"]
     # Give the graceful SIGINT shutdown room to settle/cancel orders, resolve
     # the final window, and flush the CSV before the container is killed.
     stop_grace_period: 30s
