@@ -1,29 +1,18 @@
-// live-trader: executes real Polymarket orders on the SAME entry criteria as
-// `live-itm`, headless. During the eligible late part of each 5-min
-// btc-updown-5m window it watches both outcome books and, for the first side
-// whose ask sits in [--min-ask, --max-ask] with bid >= --min-bid AND whose
-// direction matches the live BTC median-vs-target signal, it posts a resting
-// GTC limit BUY at that ask sized to --notional USDC. The window locks after
-// the first side fires (no straddles). At rollover it reads each order's fill
-// (`size_matched`), cancels any unfilled remainder, resolves the window via
-// Pyth (target vs final) + the on-chain PM winner, and logs one CSV row per
-// order with realized PnL on the filled size.
+// dry-trader: runs the live-trader entry strategy against the live book
+// WITHOUT posting orders — no wallet, no sizing, nothing spent. It exists to
+// collect data: defaults are deliberately LOOSER than live-trader's so runs
+// map where the edge lives across the feature space, and each entry is scored
+// per-share exactly like live-itm (win = 1 − ask, loss = −ask). CSVs default
+// to dry-data/ and follow live-itm's schema (per-share pnl, no order/size
+// columns), so there is no notional and no fill simulation to argue with.
 //
-// Order placement is always LIVE. For a no-wallet, no-spend run of the same
-// strategy (simulated fills, CSVs in dry-data/), use dry-trader instead.
-//
-// !!! KEEP IN SYNC with dry-trader/src/main.rs !!!
-// dry-trader is this file minus the exec layer (and minus sizing — it scores
-// per-share and follows live-itm's CSV schema). Any change to entry criteria,
-// captured features, window/rollover handling, or resolution must be made in
-// BOTH files so dry and live data stay comparable. Criteria DEFAULTS are the
-// one sanctioned difference: strict here, loose there for data collection.
-//
-// Entry criteria are in turn intentionally identical to live-itm/src/main.rs —
-// see the `try_trigger` / direction / window-lock logic there. The only
-// additions here are sizing, posting, fill tracking, and cancel-on-rollover.
-
-mod exec;
+// !!! KEEP IN SYNC with live-trader/src/main.rs !!!
+// The entry criteria, captured features, window/rollover handling, and
+// resolution logic here are copies of live-trader (which in turn mirrors
+// live-itm/src/main.rs). Any change to that logic must be made in BOTH files
+// — only the criteria DEFAULTS are allowed to differ (loose here, strict
+// there), so dry data stays comparable to live data under the same flags.
+// The CSV schema follows live-itm's write_row, not live-trader's.
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
@@ -40,10 +29,8 @@ use polymarket_core::{
     RecordedEvent, U256,
 };
 use tokio::signal;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
-
-use exec::{ExecCmd, ExecConfig, PlaceOutcome, spawn_executor};
 
 const COINBASE_PRODUCT: &str = "BTC-USD";
 const KRAKEN_SYMBOL: &str = "BTC/USD";
@@ -52,57 +39,22 @@ const WINDOW_SECS: u64 = 300;
 const VENUES: &[CexVenue] = &[CexVenue::Coinbase, CexVenue::Kraken, CexVenue::Bitstamp];
 const MEDIAN_FRESHNESS: Duration = Duration::from_secs(5);
 const SWING_BUFFER_RETENTION: Duration = Duration::from_secs(60);
-const POLYGON_CHAIN_ID: u64 = 137;
-const DEFAULT_KEY_ENV: &str = "POLY_PRIVATE_KEY";
-const DEFAULT_CLOB_HOST: &str = "https://clob.polymarket.com";
 
 const TARGET_FETCH_RETRIES: u32 = 5;
 const TARGET_FETCH_BACKOFF: Duration = Duration::from_secs(2);
 
-/// One real entry on a side. `ask`/`offset_s`/`swing_at_entry` are captured
-/// at trigger time (identical to live-itm); the rest are filled in once the
-/// order is posted and again at settlement.
-#[derive(Clone)]
+/// One recorded entry on a side, captured at trigger time. Identical to
+/// live-itm's Entry: no size, no order — the row IS the trade.
+#[derive(Clone, Copy)]
 struct Entry {
     ask: Decimal,
     offset_s: u64,
+    /// Side's ask delta over `swing_lookback` at trigger time.
     swing_at_entry: Option<Decimal>,
     /// Multi-venue BTC median at the instant the entry triggered. Compared
     /// against the window target to log how far in-the-money the side already
     /// was at entry (`price_diff_from_entry` = entry − target).
     btc_at_entry: Option<Decimal>,
-    /// Intended share size = round(notional / ask, 2). Set at submit.
-    size: Decimal,
-    /// Whether we've already sent the Place command for this entry.
-    submitted: bool,
-    order_id: Option<String>,
-    /// Post status string and any error, for the CSV/log.
-    status: String,
-    error: Option<String>,
-    /// Filled shares, read at settle via the order's `size_matched`.
-    matched: Decimal,
-}
-
-impl Entry {
-    fn new(
-        ask: Decimal,
-        offset_s: u64,
-        swing_at_entry: Option<Decimal>,
-        btc_at_entry: Option<Decimal>,
-    ) -> Self {
-        Entry {
-            ask,
-            offset_s,
-            swing_at_entry,
-            btc_at_entry,
-            size: Decimal::ZERO,
-            submitted: false,
-            order_id: None,
-            status: String::new(),
-            error: None,
-            matched: Decimal::ZERO,
-        }
-    }
 }
 
 struct SideState {
@@ -176,9 +128,7 @@ struct State {
     btc_target: Option<Target>,
 
     out: BufWriter<File>,
-    exec_tx: mpsc::UnboundedSender<ExecCmd>,
 
-    notional: Decimal,
     min_ask: Decimal,
     max_ask: Decimal,
     min_bid: Decimal,
@@ -189,7 +139,7 @@ struct State {
     max_offset_s: u64,
     swing_lookback: Duration,
 
-    n_orders: u64,
+    n_entries: u64,
     n_wins: u64,
     n_losses: u64,
     n_unresolved: u64,
@@ -245,7 +195,7 @@ fn now_wall_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// First qualifying tick on a side captures the entry. Mirrors live-itm's
+/// First qualifying tick on a side captures the entry. Mirrors live-trader's
 /// `try_trigger` exactly: eligible offset window, ask band (inclusive both
 /// ends), bid floor, and direction match. The window-lock (only the first
 /// side may fire) is enforced by the caller via `window_locked`.
@@ -293,7 +243,14 @@ fn try_trigger(
         (Some(m), Some(t)) if (m - t).abs() >= min_target_dist => {}
         _ => return,
     }
-    side.entry = Some(Entry::new(ask, offset_s, swing, btc_median));
+    side.entry = Some(Entry {
+        ask,
+        offset_s,
+        swing_at_entry: swing,
+        btc_at_entry: btc_median,
+    });
+    let remaining = WINDOW_SECS.saturating_sub(offset_s);
+    eprintln!(">>> DRY ENTRY {side_label} @ {ask} +{offset_s}s in, {remaining}s left");
 }
 
 fn apply_pm(state: &mut State, e: &PolymarketEvent) {
@@ -396,109 +353,6 @@ fn apply_event(state: &mut State, evt: RecordedEvent) {
     }
 }
 
-/// After draining events, post any captured-but-unsubmitted entry. Sizing is
-/// fixed USDC notional: shares = round(notional / ask, 2).
-async fn submit_pending(state: &mut State) {
-    for label in ["YES", "NO "] {
-        let side = if label == "YES" {
-            &mut state.pm.yes
-        } else {
-            &mut state.pm.no
-        };
-        let Some(entry) = side.entry.as_mut() else {
-            continue;
-        };
-        if entry.submitted {
-            continue;
-        }
-        entry.submitted = true; // mark first so a failed send isn't retried in a loop
-
-        let size = (state.notional / entry.ask).round_dp(2);
-        if size <= Decimal::ZERO {
-            entry.status = "skipped: size<=0".to_string();
-            eprintln!(">>> {label} entry @ {} but size {size} <= 0, not posting", entry.ask);
-            continue;
-        }
-        entry.size = size;
-        let token_id = side.token_id;
-        let price = entry.ask;
-
-        let (reply_tx, reply_rx) = oneshot::channel::<PlaceOutcome>();
-        if state
-            .exec_tx
-            .send(ExecCmd::Place {
-                token_id,
-                price,
-                size,
-                reply: reply_tx,
-            })
-            .is_err()
-        {
-            entry.status = "executor gone".to_string();
-            eprintln!("WARN: executor channel closed; cannot post {label} order");
-            continue;
-        }
-        match reply_rx.await {
-            Ok(outcome) => {
-                let remaining = WINDOW_SECS.saturating_sub(entry.offset_s);
-                entry.order_id = outcome.order_id.clone();
-                entry.status = outcome.status.clone();
-                entry.error = outcome.error.clone();
-                state.n_orders += 1;
-                eprintln!(
-                    ">>> ORDER {label} BUY {size} @ {price} (notional ~{}) +{}s in, {remaining}s left | status={} id={} took={}{}",
-                    state.notional,
-                    entry.offset_s,
-                    outcome.status,
-                    outcome.order_id.as_deref().unwrap_or("—"),
-                    outcome.immediate_taking,
-                    outcome
-                        .error
-                        .as_ref()
-                        .map(|e| format!(" err={e}"))
-                        .unwrap_or_default(),
-                );
-            }
-            Err(_) => {
-                entry.status = "no reply".to_string();
-                eprintln!("WARN: no reply from executor for {label} order");
-            }
-        }
-    }
-}
-
-/// At rollover, ask the executor for each posted order's fill and cancel the
-/// remainder. Mutates `matched` on the entries in place.
-async fn settle_orders(state: &mut State) {
-    for label in ["YES", "NO "] {
-        let side = if label == "YES" {
-            &mut state.pm.yes
-        } else {
-            &mut state.pm.no
-        };
-        let Some(entry) = side.entry.as_mut() else {
-            continue;
-        };
-        let Some(order_id) = entry.order_id.clone() else {
-            continue;
-        };
-        let (reply_tx, reply_rx) = oneshot::channel::<Decimal>();
-        if state
-            .exec_tx
-            .send(ExecCmd::Settle {
-                order_id,
-                reply: reply_tx,
-            })
-            .is_err()
-        {
-            continue;
-        }
-        if let Ok(matched) = reply_rx.await {
-            entry.matched = matched;
-        }
-    }
-}
-
 struct OldWindow {
     window_start_ts: u64,
     condition_id: String,
@@ -521,7 +375,7 @@ struct ResolvedWindow {
 }
 
 /// Build the closing window's resolver input. Returns None when neither side
-/// posted an order — nothing to resolve or log.
+/// triggered — nothing to resolve or log.
 fn snapshot_window(state: &State) -> Option<OldWindow> {
     if state.pm.yes.entry.is_none() && state.pm.no.entry.is_none() {
         return None;
@@ -532,8 +386,8 @@ fn snapshot_window(state: &State) -> Option<OldWindow> {
         target: state.btc_target.map(|t| t.value),
         yes_token: state.pm.yes.token_id,
         no_token: state.pm.no.token_id,
-        yes_entry: state.pm.yes.entry.clone(),
-        no_entry: state.pm.no.entry.clone(),
+        yes_entry: state.pm.yes.entry,
+        no_entry: state.pm.no.entry,
     })
 }
 
@@ -556,16 +410,7 @@ async fn fetch_final_pyth_retry(pm: &Polymarket, window_end_ts: u64) -> Option<D
 
 /// Poll the CLOB market until it closes and reports a winner; match the winner
 /// token back to a side. Returns None if it never resolves within the budget.
-///
-/// Polymarket's on-chain winner is the *primary* resolution source, so we poll
-/// it patiently: ~20 minutes (240 * 5s). The CLOB market object persists past
-/// the 5-minute trading window — it stays queryable by `condition_id` — so we
-/// just re-query the same market until the `winner` flag flips after on-chain
-/// resolution lands. The `closed`/`winner` flags routinely lag the window by
-/// several minutes; the old 5-minute budget expired before PM ever reported,
-/// so almost every row resolved via the Pyth last-resort fallback instead. The
-/// resolver runs in its own background task, so a long poll across several
-/// later windows costs nothing but a delayed authoritative row.
+/// See live-trader for the rationale on the patient ~20-minute budget.
 async fn poll_pm_winner(
     pm: &Polymarket,
     condition_id: &str,
@@ -615,18 +460,8 @@ async fn resolve_window(
     });
 }
 
-/// The window's 5-minute period index within the local day: 00:00 local -> 0,
-/// 00:05 -> 1, ... 23:55 -> 287. `window_start_ts` is always 300s-aligned so
-/// this is exact. None only if the timestamp can't be mapped to local time.
-fn period_of_day(window_start_ts: u64) -> Option<u32> {
-    use chrono::{Local, TimeZone, Timelike};
-    Local
-        .timestamp_opt(window_start_ts as i64, 0)
-        .single()
-        .map(|dt| dt.num_seconds_from_midnight() / 300)
-}
-
-fn pnl_per_share(entry_ask: Decimal, win: bool) -> Decimal {
+/// Per-share PnL, same as live-itm: win = 1 − ask, loss = −ask.
+fn pnl_for(entry_ask: Decimal, win: bool) -> Decimal {
     if win {
         Decimal::ONE - entry_ask
     } else {
@@ -634,9 +469,18 @@ fn pnl_per_share(entry_ask: Decimal, win: bool) -> Decimal {
     }
 }
 
+/// True iff the side's ask was falling over the lookback window — i.e.
+/// the market was moving against the side we just bought. Symmetric for
+/// YES/NO: a down move in the token's own ask is always "the market
+/// doubts this side." Unknown swing → None. (Same as live-itm.)
+fn entered_on_down_swing(swing: Option<Decimal>) -> Option<bool> {
+    let s = swing?;
+    Some(s.is_sign_negative() && !s.is_zero())
+}
+
 fn sink_resolved(state: &mut State, r: ResolvedWindow) {
     // Prefer the authoritative on-chain winner; fall back to Pyth target-vs-final.
-    let (resolved_side, _source) = match r.pm_winner_side {
+    let (resolved_side, source) = match r.pm_winner_side {
         Some(s) => (Some(s), "pm"),
         None => match (r.target, r.final_pyth) {
             (Some(t), Some(f)) => (Some(if f > t { "YES" } else { "NO " }), "pyth"),
@@ -646,24 +490,21 @@ fn sink_resolved(state: &mut State, r: ResolvedWindow) {
 
     for (side, entry_opt) in [("YES", r.yes_entry), ("NO ", r.no_entry)] {
         let Some(entry) = entry_opt else { continue };
-        let (won, realized) = match resolved_side {
+        let (won, pnl) = match resolved_side {
             Some(rs) => {
                 let win = rs.trim() == side.trim();
-                // Realized PnL is on the FILLED shares only.
-                let realized = entry.matched * pnl_per_share(entry.ask, win);
-                if entry.matched > Decimal::ZERO {
-                    if win {
-                        state.n_wins += 1;
-                    } else {
-                        state.n_losses += 1;
-                    }
-                    state.pnl += realized;
+                let p = pnl_for(entry.ask, win);
+                if win {
+                    state.n_wins += 1;
+                } else {
+                    state.n_losses += 1;
                 }
-                (Some(win), realized)
+                state.pnl += p;
+                (Some(win), Some(p))
             }
             None => {
                 state.n_unresolved += 1;
-                (None, Decimal::ZERO)
+                (None, None)
             }
         };
         if let Err(e) = write_row(
@@ -671,25 +512,28 @@ fn sink_resolved(state: &mut State, r: ResolvedWindow) {
             r.window_start_ts,
             &r.condition_id,
             side.trim(),
-            &entry,
-            state.notional,
+            entry,
             r.target,
             r.final_pyth,
             resolved_side.map(|s| s.trim()),
+            source,
             won,
-            realized,
+            pnl,
         ) {
             eprintln!("WARN: write row: {e:#}");
         }
     }
 }
 
+// CSV schema follows live-itm/src/main.rs, NOT live-trader (no order/size/
+// notional columns — pnl is per share). Keep column changes in step with
+// live-itm so both papertrading datasets stay analyzable with one loader.
 fn write_header(w: &mut BufWriter<File>) -> Result<()> {
     writeln!(
         w,
-        "window_start_ts,period_of_day,condition_id,side,order_id,intended_ask,size_shares,size_matched,\
-         notional_target,entry_offset_s,swing_at_entry,btc_at_entry,post_status,post_error,\
-         target_pyth,final_pyth,price_diff_from_entry,resolved_side,won,realized_pnl"
+        "window_start_ts,condition_id,side,entry_ask,entry_offset_s,\
+         swing_at_entry,entered_on_down_swing,btc_at_entry,\
+         target_pyth,final_pyth,price_diff_from_entry,resolved_side,resolved_source,won,pnl"
     )?;
     w.flush()?;
     Ok(())
@@ -701,19 +545,26 @@ fn write_row(
     window_start_ts: u64,
     condition_id: &str,
     side: &str,
-    entry: &Entry,
-    notional: Decimal,
+    entry: Entry,
     target: Option<Decimal>,
     final_pyth: Option<Decimal>,
     resolved_side: Option<&str>,
+    resolved_source: &str,
     won: Option<bool>,
-    realized: Decimal,
+    pnl: Option<Decimal>,
 ) -> Result<()> {
-    let order_id = entry.order_id.as_deref().unwrap_or("");
+    let target_s = target.map(|d| d.to_string()).unwrap_or_default();
+    let final_s = final_pyth.map(|d| d.to_string()).unwrap_or_default();
+    let resolved_s = resolved_side.unwrap_or("");
+    let won_s = won.map(|b| if b { "1" } else { "0" }).unwrap_or("");
+    let pnl_s = pnl.map(|d| d.to_string()).unwrap_or_default();
     let swing_s = entry
         .swing_at_entry
         .map(|d| d.to_string())
         .unwrap_or_default();
+    let down_s = entered_on_down_swing(entry.swing_at_entry)
+        .map(|b| if b { "1" } else { "0" })
+        .unwrap_or("");
     let btc_entry_s = entry
         .btc_at_entry
         .map(|d| d.to_string())
@@ -725,20 +576,10 @@ fn write_row(
         (Some(entry_px), Some(target_px)) => (entry_px - target_px).to_string(),
         _ => String::new(),
     };
-    // Keep status/error inside a single CSV field by swapping commas.
-    let status_s = entry.status.replace(',', ";");
-    let error_s = entry.error.as_deref().unwrap_or("").replace(',', ";");
-    let target_s = target.map(|d| d.to_string()).unwrap_or_default();
-    let final_s = final_pyth.map(|d| d.to_string()).unwrap_or_default();
-    let resolved_s = resolved_side.unwrap_or("");
-    let won_s = won.map(|b| if b { "1" } else { "0" }).unwrap_or("");
-    let period_s = period_of_day(window_start_ts)
-        .map(|p| p.to_string())
-        .unwrap_or_default();
     writeln!(
         w,
-        "{window_start_ts},{period_s},{condition_id},{side},{order_id},{},{},{},{notional},{},{swing_s},{btc_entry_s},{status_s},{error_s},{target_s},{final_s},{price_diff_s},{resolved_s},{won_s},{realized}",
-        entry.ask, entry.size, entry.matched, entry.offset_s,
+        "{window_start_ts},{condition_id},{side},{},{},{swing_s},{down_s},{btc_entry_s},{target_s},{final_s},{price_diff_s},{resolved_s},{resolved_source},{won_s},{pnl_s}",
+        entry.ask, entry.offset_s,
     )?;
     w.flush()?;
     Ok(())
@@ -856,15 +697,14 @@ fn print_summary(state: &State) {
         0.0
     };
     eprintln!(
-        "orders={} filled_wins={} filled_losses={} unresolved={} | win_rate={:.1}% realized_pnl={}",
-        state.n_orders, state.n_wins, state.n_losses, state.n_unresolved, win_rate, state.pnl,
+        "entries={} wins={} losses={} unresolved={} | win_rate={:.1}% pnl_per_share={}",
+        state.n_entries, state.n_wins, state.n_losses, state.n_unresolved, win_rate, state.pnl,
     );
 }
 
 struct Args {
     out_path: Option<PathBuf>,
     explicit_market: Option<String>,
-    notional: Decimal,
     min_ask: Decimal,
     max_ask: Decimal,
     min_bid: Decimal,
@@ -872,42 +712,38 @@ struct Args {
     min_offset_s: u64,
     max_offset_s: u64,
     swing_lookback_s: u64,
-    key_env: String,
-    host: String,
-    chain_id: u64,
-    funder: Option<String>,
-    /// CLOB signature type (0=EOA, 1=Proxy, 2=GnosisSafe, 3=Poly1271). `None`
-    /// until set by `--signature-type` or `$POLY_SIG_TYPE`; falls back to 0.
-    signature_type: Option<u8>,
 }
 
 fn parse_args() -> Result<Args> {
+    // Defaults are deliberately LOOSER than live-trader's — the point of a
+    // dry run is to observe entries the live criteria would skip, so the
+    // analysis can find where edge starts and stops. The ask band opens a
+    // notch below live (0.94 vs 0.95) and min_target_dist drops to 0 to
+    // record the marginal near-strike entries live filters out.
+    //
+    // Gates intentionally kept at live values:
+    //  - min_offset: entering at 240s+ is what defines the strategy; also the
+    //    trigger takes the FIRST qualifying tick per window, so a low offset
+    //    floor would capture early entries at the expense of the late trade.
+    //  - min_bid: rows are scored as if filled at the ask, which is fiction on
+    //    wide-spread thin books; the bid floor keeps entries where a real fill
+    //    was plausible.
     let mut a = Args {
         out_path: None,
         explicit_market: None,
-        notional: Decimal::new(5, 0),
-        min_ask: Decimal::new(95, 2),
+        min_ask: Decimal::new(94, 2),
         max_ask: Decimal::new(99, 2),
         min_bid: Decimal::new(50, 2),
-        min_target_dist: Decimal::from(45),
+        min_target_dist: Decimal::ZERO,
         min_offset_s: 240,
         max_offset_s: WINDOW_SECS - 10,
         swing_lookback_s: 10,
-        key_env: DEFAULT_KEY_ENV.to_string(),
-        host: DEFAULT_CLOB_HOST.to_string(),
-        chain_id: POLYGON_CHAIN_ID,
-        funder: None,
-        signature_type: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-o" | "--out" => {
                 a.out_path = Some(PathBuf::from(args.next().context("--out needs a path")?))
-            }
-            "--notional" => {
-                let v = args.next().context("--notional needs a value")?;
-                a.notional = v.parse().with_context(|| format!("parsing --notional {v}"))?;
             }
             "--min-ask" => {
                 let v = args.next().context("--min-ask needs a value")?;
@@ -939,25 +775,6 @@ fn parse_args() -> Result<Args> {
                 a.swing_lookback_s =
                     v.parse().with_context(|| format!("parsing --swing-lookback {v}"))?;
             }
-            "--key-env" => {
-                a.key_env = args.next().context("--key-env needs a value")?;
-            }
-            "--host" => {
-                a.host = args.next().context("--host needs a value")?;
-            }
-            "--chain-id" => {
-                let v = args.next().context("--chain-id needs a value")?;
-                a.chain_id = v.parse().with_context(|| format!("parsing --chain-id {v}"))?;
-            }
-            "--funder" => {
-                a.funder = Some(args.next().context("--funder needs an address")?);
-            }
-            "--signature-type" => {
-                let v = args.next().context("--signature-type needs a value (0-3)")?;
-                let n: u8 = v.parse().with_context(|| format!("parsing --signature-type {v}"))?;
-                anyhow::ensure!(n <= 3, "--signature-type must be 0-3, got {n}");
-                a.signature_type = Some(n);
-            }
             other => {
                 if a.explicit_market.is_none() {
                     a.explicit_market = Some(other.to_string());
@@ -974,56 +791,12 @@ fn parse_args() -> Result<Args> {
 async fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let mut args = parse_args()?;
+    let args = parse_args()?;
     let auto_roll = args.explicit_market.is_none();
-
-    // The funder (Polymarket proxy/email wallet) is a fixed, public address, so
-    // unlike the private key it can live in config. Fall back to $POLY_FUNDER when
-    // --funder isn't passed; the CLI flag still wins for one-off overrides.
-    if args.funder.is_none() {
-        if let Ok(funder) = std::env::var("POLY_FUNDER") {
-            if !funder.trim().is_empty() {
-                args.funder = Some(funder);
-            }
-        }
-    }
-
-    // Same treatment for the signature type, which must match the funder's wallet
-    // kind (2 = GnosisSafe/browser-wallet proxy like Phantom, 3 = deposit wallet).
-    if args.signature_type.is_none() {
-        if let Ok(v) = std::env::var("POLY_SIG_TYPE") {
-            let v = v.trim();
-            if !v.is_empty() {
-                let n: u8 = v
-                    .parse()
-                    .with_context(|| format!("parsing $POLY_SIG_TYPE {v}"))?;
-                anyhow::ensure!(n <= 3, "$POLY_SIG_TYPE must be 0-3, got {n}");
-                args.signature_type = Some(n);
-            }
-        }
-    }
-
-    // Optional pre-issued CLOB API credentials (Polymarket "API keys" screen).
-    // When all three are set they're injected as-is, bypassing the SDK's
-    // EOA-bound key derivation — required for deposit-wallet/Poly1271 accounts.
-    let nonempty = |name: &str| std::env::var(name).ok().filter(|s| !s.trim().is_empty());
-    let api_creds = match (
-        nonempty("POLY_API_KEY"),
-        nonempty("POLY_API_SECRET"),
-        nonempty("POLY_API_PASSPHRASE"),
-    ) {
-        (Some(k), Some(s), Some(p)) => Some((k, s, p)),
-        _ => None,
-    };
-
-    // Read the private key from the environment (never the command line). For a
-    // walletless simulated run, use dry-trader instead.
-    let private_key = std::env::var(&args.key_env)
-        .with_context(|| format!("reading private key from ${}", args.key_env))?;
 
     let out_path = args.out_path.clone().unwrap_or_else(|| {
         let stamp = chrono::Local::now().format("%m-%d-%Y-%H.%M");
-        PathBuf::from(format!("data/trade-{stamp}.csv"))
+        PathBuf::from(format!("dry-data/trade-{stamp}.csv"))
     });
     if let Some(parent) = out_path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)
@@ -1035,49 +808,15 @@ async fn main() -> Result<()> {
     write_header(&mut out)?;
 
     eprintln!(
-        "live-trader LIVE | notional=${} ask in [{}, {}] bid>={} offset [{}, {})s swing={}s",
-        args.notional,
+        "dry-trader (no orders, per-share pnl) | ask in [{}, {}] bid>={} dist>={} offset [{}, {})s swing={}s",
         args.min_ask,
         args.max_ask,
         args.min_bid,
+        args.min_target_dist,
         args.min_offset_s,
         args.max_offset_s,
         args.swing_lookback_s,
     );
-    eprintln!("!!! LIVE: real GTC limit BUY orders will be posted to Polymarket !!!");
-    match &args.funder {
-        Some(f) => eprintln!("funder (proxy wallet): {f}"),
-        None => eprintln!("funder: none (signing wallet is the funder)"),
-    }
-    let st = args.signature_type.unwrap_or(0);
-    let st_name = match st {
-        0 => "EOA",
-        1 => "Proxy (email/magic)",
-        2 => "GnosisSafe (browser-wallet proxy)",
-        3 => "Poly1271 (deposit wallet)",
-        _ => "?",
-    };
-    eprintln!("signature type: {st} ({st_name})");
-    if api_creds.is_some() {
-        eprintln!("API credentials: injected from POLY_API_KEY/SECRET/PASSPHRASE");
-    } else {
-        eprintln!("API credentials: deriving from signer (no POLY_API_* set)");
-    }
-
-    // Bring up the executor and wait for authentication before trading.
-    let (exec_tx, ready_rx, _exec_handle) = spawn_executor(ExecConfig {
-        host: args.host.clone(),
-        private_key,
-        chain_id: args.chain_id,
-        funder: args.funder.clone(),
-        signature_type: args.signature_type.unwrap_or(0),
-        api_creds,
-    });
-    match ready_rx.await {
-        Ok(Ok(addr)) => eprintln!("executor ready (wallet {addr})"),
-        Ok(Err(e)) => return Err(anyhow!("executor failed to start: {e}")),
-        Err(_) => return Err(anyhow!("executor task died before signaling readiness")),
-    }
 
     let pm = Arc::new(Polymarket::new()?);
     let condition_id = match &args.explicit_market {
@@ -1119,8 +858,6 @@ async fn main() -> Result<()> {
         btc: HashMap::new(),
         btc_target: None,
         out,
-        exec_tx,
-        notional: args.notional,
         min_ask: args.min_ask,
         max_ask: args.max_ask,
         min_bid: args.min_bid,
@@ -1128,7 +865,7 @@ async fn main() -> Result<()> {
         min_offset_s: args.min_offset_s,
         max_offset_s: args.max_offset_s,
         swing_lookback: Duration::from_secs(args.swing_lookback_s),
-        n_orders: 0,
+        n_entries: 0,
         n_wins: 0,
         n_losses: 0,
         n_unresolved: 0,
@@ -1165,8 +902,6 @@ async fn main() -> Result<()> {
                         Err(broadcast::error::TryRecvError::Closed) => break,
                     }
                 }
-                // Post any freshly-captured entry.
-                submit_pending(&mut state).await;
             }
             Some(r) = resolved_rx.recv() => {
                 sink_resolved(&mut state, r);
@@ -1179,10 +914,9 @@ async fn main() -> Result<()> {
                 }
             }
             _ = tokio::time::sleep(rollover_in), if auto_roll => {
-                // Settle the closing window's orders (read fills + cancel
-                // remainders) before handing off to the async resolver.
-                settle_orders(&mut state).await;
                 if let Some(old) = snapshot_window(&state) {
+                    state.n_entries += old.yes_entry.is_some() as u64
+                        + old.no_entry.is_some() as u64;
                     let pm_c = pm.clone();
                     let tx_c = resolved_tx.clone();
                     let cancel_c = Arc::clone(&cancel);
@@ -1210,12 +944,12 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Settle + resolve the final in-progress window on shutdown. Signal the
-    // patient PM polls to stop so any in-flight resolvers fall straight back to
-    // Pyth instead of blocking exit for up to ~20 minutes each.
+    // Resolve the final in-progress window on shutdown. Signal the patient PM
+    // polls to stop so any in-flight resolvers fall straight back to Pyth
+    // instead of blocking exit for up to ~20 minutes each.
     cancel.store(true, Ordering::Relaxed);
-    settle_orders(&mut state).await;
     if let Some(old) = snapshot_window(&state) {
+        state.n_entries += old.yes_entry.is_some() as u64 + old.no_entry.is_some() as u64;
         let pm_c = pm.clone();
         let tx_c = resolved_tx.clone();
         let cancel_c = Arc::clone(&cancel);

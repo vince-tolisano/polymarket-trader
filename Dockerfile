@@ -1,9 +1,11 @@
 # syntax=docker/dockerfile:1
 #
 # Container image for the `live-trader` binary — the one crate that signs and
-# posts REAL orders. Multi-stage: a Rust builder (needs a C toolchain for
-# rustls/ring) and a minimal Debian runtime (needs ca-certificates for the
-# rustls "native-roots" TLS used to reach Polymarket / Pyth / the CEX feeds).
+# posts REAL orders — plus its no-wallet sibling `dry-trader` (same strategy,
+# simulated fills, CSVs in dry-data/). Multi-stage: a Rust builder (needs a C
+# toolchain for rustls/ring) and a minimal Debian runtime (needs
+# ca-certificates for the rustls "native-roots" TLS used to reach Polymarket /
+# Pyth / the CEX feeds).
 #
 # Build:  docker build -t polymarket-live-trader .
 # Run:    see README notes / docker-compose.yml. The private key is read from
@@ -27,8 +29,9 @@ COPY . .
 # once an updated Cargo.lock is committed.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p live-trader \
-    && cp target/release/live-trader /usr/local/bin/live-trader
+    cargo build --release -p live-trader -p dry-trader \
+    && cp target/release/live-trader /usr/local/bin/live-trader \
+    && cp target/release/dry-trader /usr/local/bin/dry-trader
 
 # ---- Runtime -------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
@@ -46,10 +49,12 @@ RUN useradd --system --uid 10001 --create-home --home-dir /app trader
 
 WORKDIR /app
 COPY --from=builder /usr/local/bin/live-trader /usr/local/bin/live-trader
+COPY --from=builder /usr/local/bin/dry-trader /usr/local/bin/dry-trader
 
-# CSVs default to ./data/trade-<stamp>.csv (created relative to WORKDIR).
-RUN mkdir -p /app/data && chown -R trader:trader /app
-VOLUME ["/app/data"]
+# CSVs default to ./data/trade-<stamp>.csv for live-trader and
+# ./dry-data/trade-<stamp>.csv for dry-trader (relative to WORKDIR).
+RUN mkdir -p /app/data /app/dry-data && chown -R trader:trader /app
+VOLUME ["/app/data", "/app/dry-data"]
 
 USER trader
 
@@ -60,6 +65,7 @@ USER trader
 STOPSIGNAL SIGINT
 
 # Faithful to the binary: LIVE by default (posts real orders once
-# POLY_PRIVATE_KEY is set). Pass --dry-run to run the full strategy with no
-# wallet and no posting. Extra flags after the image name are forwarded here.
+# POLY_PRIVATE_KEY is set). For the no-wallet simulated run, override the
+# entrypoint to /usr/local/bin/dry-trader (docker-compose.yml's dry-trader
+# service does this). Extra flags after the image name are forwarded here.
 ENTRYPOINT ["/usr/local/bin/live-trader"]

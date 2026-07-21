@@ -5,9 +5,10 @@ The image is built **on the instance**; the private key lives in **SSM Parameter
 Store**; CSVs persist on the instance's EBS volume. All steps use region
 `eu-west-1`.
 
-> The bot places **real orders** when live. `docker-compose.yml` defaults to
-> `--dry-run`; going live is a deliberate edit (last section). Confirm the
-> deployment complies with Polymarket's terms and any law that applies to you.
+> The bot places **real orders** when live. `docker compose up` starts only
+> the walletless dry-trader service; going live means enabling the `live`
+> compose profile (last section). Confirm the deployment complies with
+> Polymarket's terms and any law that applies to you.
 
 ## 1. Store the secret in SSM
 
@@ -80,16 +81,22 @@ ls -l data/                          # trade-<stamp>.csv appearing
 tail -f /var/log/cloud-init-output.log   # if the build/bootstrap failed
 ```
 
-It starts in **dry-run** (safe): full strategy, no wallet, no orders.
+It starts with the **dry-trader** service only (safe): full strategy, no
+wallet, no orders, simulated CSVs in `dry-data/`. The live-trader service is
+gated behind the `live` compose profile and never starts on a plain `up`.
 
 ## 5. Go live
 
-Edit the compose command to drop `--dry-run`, then restart:
+Enable the `live` profile in the systemd unit (this runs dry AND live side by
+side — the dry run keeps mapping the feature space while real orders post):
 
 ```bash
 cd /opt/polymarket-trader
-sudo sed -i 's/\["--dry-run"\]/[]/' docker-compose.yml   # or edit by hand;
-                                                          # add flags e.g. ["--notional","5","--min-target-dist","35"]
+sudo sed -i 's|docker compose up -d|docker compose --profile live up -d|' \
+  /etc/systemd/system/polymarket-trader.service
+# strategy flags live in docker-compose.yml under the live-trader service's
+# `command:`, e.g. ["--notional","5","--min-target-dist","35"]
+sudo systemctl daemon-reload
 sudo systemctl restart polymarket-trader
 sudo docker compose logs -f
 ```

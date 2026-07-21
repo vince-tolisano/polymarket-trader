@@ -1,21 +1,45 @@
-# Convenience wrapper for the containerized live-trader.
+# Convenience wrapper for the containerized traders.
 #
 #   Build:        docker compose build
-#   Dry-run:      docker compose up          (default command below is --dry-run)
-#   GO LIVE:      docker compose run --rm live-trader        (no --dry-run → real orders)
-#     or edit `command:` below to drop --dry-run for `up`.
+#   Dry (safe):   docker compose up                 (starts dry-trader only —
+#                                                    no wallet, nothing posted)
+#   GO LIVE:      docker compose --profile live up -d      (dry + live), or
+#                 docker compose run --rm live-trader <flags>  (live one-off)
 #
 # The private key is supplied at runtime via the environment (a local .env file
 # holding POLY_PRIVATE_KEY, or your shell). It is never written into the image.
 
 services:
+  # SAFE DEFAULT: same entry strategy as live-trader but nothing is posted —
+  # no wallet, no sizing, per-share pnl in live-itm's CSV schema. Its built-in
+  # defaults are already loose for data collection. Plain `docker compose up`
+  # starts only this service.
+  dry-trader:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: polymarket-live-trader
+    entrypoint: ["/usr/local/bin/dry-trader"]
+    environment:
+      TZ: ${TZ:-UTC}
+    # Dry CSVs land in ./dry-data on the host, separate from real fills.
+    volumes:
+      - ./dry-data:/app/dry-data
+    # Optional strategy flags, e.g. to mirror live-trader's strict criteria:
+    # ["--min-ask", "0.95", "--min-target-dist", "45"]
+    command: []
+    stop_grace_period: 30s
+    init: true
+    restart: unless-stopped
+
+  # REAL orders. Gated behind the "live" profile so `docker compose up` can
+  # never start it by accident; opt in with --profile live or `compose run`.
   live-trader:
     build:
       context: .
       dockerfile: Dockerfile
     image: polymarket-live-trader
-    # Fail fast if the key isn't provided (dry-run doesn't need it, but this
-    # keeps the two paths symmetric — remove the `:?...` to make it optional).
+    profiles: ["live"]
     environment:
       POLY_PRIVATE_KEY: ${POLY_PRIVATE_KEY:-}
       # Polymarket proxy wallet address (public, constant). Signing is done by
@@ -37,10 +61,8 @@ services:
     # container uid, so writes work regardless of ownership).
     volumes:
       - ./data:/app/data
-    # SAFE DEFAULT: dry-run (no wallet, no posting). Remove --dry-run — or use
-    # `docker compose run --rm live-trader` with your own flags — to trade live.
-    # Add strategy flags here too, e.g. --notional 5 --min-target-dist 35.
-    command: ["--notional 1"]
+    # Strategy flags, e.g. --notional 1 --min-target-dist 35.
+    command: ["--notional", "1"]
     # Give the graceful SIGINT shutdown room to settle/cancel orders, resolve
     # the final window, and flush the CSV before the container is killed.
     stop_grace_period: 30s

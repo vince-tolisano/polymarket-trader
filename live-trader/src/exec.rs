@@ -23,8 +23,7 @@ use tokio::task::JoinHandle;
 /// How to reach the CLOB and which wallet signs orders.
 pub struct ExecConfig {
     pub host: String,
-    /// Hex private key (with or without `0x`). Only read when `dry_run` is
-    /// false; in dry-run no wallet is touched.
+    /// Hex private key (with or without `0x`).
     pub private_key: String,
     /// EIP-712 domain chain id. Polymarket runs on Polygon mainnet = 137.
     pub chain_id: u64,
@@ -42,9 +41,6 @@ pub struct ExecConfig {
     /// bypassing the SDK's L1-derive step (which binds the key to the EOA and
     /// breaks the deposit-wallet/Poly1271 flow). Leave `None` to derive.
     pub api_creds: Option<(String, String, String)>,
-    /// When true, never authenticate or post — `Place` just acks. Lets you run
-    /// the full strategy against the live book without spending anything.
-    pub dry_run: bool,
 }
 
 /// Result of attempting to post a single order.
@@ -52,7 +48,7 @@ pub struct PlaceOutcome {
     /// CLOB order id, used later to query fill / cancel the remainder.
     pub order_id: Option<String>,
     pub success: bool,
-    /// Stringified `OrderStatusType` (or "dry-run" / "error").
+    /// Stringified `OrderStatusType` (or "error").
     pub status: String,
     /// Shares taken immediately at post time (the marketable portion of the
     /// GTC limit). Authoritative fill is read again at settle via `size_matched`.
@@ -100,29 +96,6 @@ async fn run_executor(
     ready_tx: oneshot::Sender<Result<String, String>>,
     mut cmd_rx: mpsc::UnboundedReceiver<ExecCmd>,
 ) {
-    // Dry-run path: no wallet, no SDK auth. Acknowledge every command so the
-    // strategy loop behaves identically minus the real spend.
-    if cfg.dry_run {
-        let _ = ready_tx.send(Ok("dry-run (no wallet)".to_string()));
-        while let Some(cmd) = cmd_rx.recv().await {
-            match cmd {
-                ExecCmd::Place { reply, .. } => {
-                    let _ = reply.send(PlaceOutcome {
-                        order_id: None,
-                        success: true,
-                        status: "dry-run".to_string(),
-                        immediate_taking: Decimal::ZERO,
-                        error: None,
-                    });
-                }
-                ExecCmd::Settle { reply, .. } => {
-                    let _ = reply.send(Decimal::ZERO);
-                }
-            }
-        }
-        return;
-    }
-
     let signer = match LocalSigner::from_str(&cfg.private_key) {
         Ok(s) => s.with_chain_id(Some(cfg.chain_id)),
         Err(e) => {

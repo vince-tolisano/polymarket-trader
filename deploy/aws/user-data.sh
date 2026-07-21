@@ -16,8 +16,10 @@
 # Prereqs (see README.md): an instance IAM role allowing ssm:GetParameter (+
 # kms:Decrypt) on the params below, and the key already stored in SSM.
 #
-# SAFETY: docker-compose.yml defaults to --dry-run. Going live is a deliberate
-# edit (see README) — this script does NOT place real orders on its own.
+# SAFETY: `docker compose up` starts only the dry-trader service (no wallet,
+# nothing posted); the live-trader service is gated behind the "live" compose
+# profile. Going live is a deliberate edit (see README) — this script does NOT
+# place real orders on its own.
 set -euxo pipefail
 
 # ---- Config (edit to taste) ---------------------------------------------
@@ -108,8 +110,11 @@ Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=${APP_DIR}
 # stop -t 30 sends STOPSIGNAL (SIGINT) and waits, matching stop_grace_period.
+# ExecStop always enables the live profile so a live-trader container (started
+# after the go-live edit, see README) is stopped gracefully too; with only the
+# dry service running the extra profile is harmless.
 ExecStart=/usr/bin/docker compose up -d
-ExecStop=/usr/bin/docker compose stop -t 30
+ExecStop=/usr/bin/docker compose --profile live stop -t 30
 TimeoutStopSec=45
 
 [Install]
