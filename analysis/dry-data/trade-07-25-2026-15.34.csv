@@ -1,0 +1,2 @@
+window_start_ts,condition_id,side,entry_ask,entry_offset_s,swing_at_entry,entered_on_down_swing,btc_at_entry,target_pyth,final_pyth,price_diff_from_entry,resolved_side,resolved_source,won,pnl
+1784993400,0x916327ba15454234789fc9812d2258bc84dafbe89775ef23ce568521288c31d8,NO,0.99,275,,,64121.21,64142.64642165,64123.06967970,-21.43642165,NO,pyth,1,0.01

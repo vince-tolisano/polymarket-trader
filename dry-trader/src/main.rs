@@ -14,7 +14,7 @@
 // there), so dry data stays comparable to live data under the same flags.
 // The CSV schema follows live-itm's write_row, not live-trader's.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -39,6 +39,11 @@ const WINDOW_SECS: u64 = 300;
 const VENUES: &[CexVenue] = &[CexVenue::Coinbase, CexVenue::Kraken, CexVenue::Bitstamp];
 const MEDIAN_FRESHNESS: Duration = Duration::from_secs(5);
 const SWING_BUFFER_RETENTION: Duration = Duration::from_secs(60);
+// Rollover retry backoff. Short at first so a transient blip costs at most one
+// window, then doubling so a sustained outage can't spin the rollover arm — at
+// the old flat 2s a stuck rollover retried ~30x/minute for as long as it lasted.
+const ROLLOVER_RETRY_MIN: Duration = Duration::from_secs(2);
+const ROLLOVER_RETRY_MAX: Duration = Duration::from_secs(60);
 
 const TARGET_FETCH_RETRIES: u32 = 5;
 const TARGET_FETCH_BACKOFF: Duration = Duration::from_secs(2);
@@ -135,6 +140,9 @@ struct State {
     /// Minimum absolute BTC distance (USD) between the median and the target
     /// required to enter — filters out marginal entries sitting on the strike.
     min_target_dist: Decimal,
+    /// Maximum absolute BTC distance (USD) allowed to enter. Decimal::MAX
+    /// means uncapped; set it to run the near-strike inverse experiment.
+    max_target_dist: Decimal,
     min_offset_s: u64,
     max_offset_s: u64,
     swing_lookback: Duration,
@@ -215,6 +223,7 @@ fn try_trigger(
     btc_median: Option<Decimal>,
     target: Option<Decimal>,
     min_target_dist: Decimal,
+    max_target_dist: Decimal,
 ) {
     side.ask = Some(ask);
     if side.entry.is_some() {
@@ -236,11 +245,16 @@ fn try_trigger(
     if direction != Some(side_label) {
         return;
     }
-    // Minimum distance past the strike: BTC must be at least `min_target_dist`
-    // (USD) away from the target, filtering out marginal entries sitting right
-    // on the strike where a tiny reversal flips the outcome.
+    // Distance past the strike, as a band [min_target_dist, max_target_dist]
+    // in USD. The floor filters out marginal entries sitting right on the
+    // strike where a tiny reversal flips the outcome. The ceiling is the
+    // INVERSE experiment: out-of-sample data through 2026-07-27 shows edge
+    // falling as distance grows (the ask more than prices the distance in),
+    // so capping it isolates the near-strike entries the floor throws away.
+    // Default ceiling is Decimal::MAX, i.e. no cap — set it explicitly.
     match (btc_median, target) {
-        (Some(m), Some(t)) if (m - t).abs() >= min_target_dist => {}
+        (Some(m), Some(t))
+            if (m - t).abs() >= min_target_dist && (m - t).abs() <= max_target_dist => {}
         _ => return,
     }
     side.entry = Some(Entry {
@@ -266,6 +280,7 @@ fn apply_pm(state: &mut State, e: &PolymarketEvent) {
     let btc_median = state.btc_median_last();
     let target_val = state.btc_target.map(|t| t.value);
     let min_target_dist = state.min_target_dist;
+    let max_target_dist = state.max_target_dist;
     let yes_token = state.pm.yes.token_id;
     let no_token = state.pm.no.token_id;
     // Window lock: if either side already has an entry, only update book state
@@ -288,6 +303,7 @@ fn apply_pm(state: &mut State, e: &PolymarketEvent) {
                 try_trigger(
                     side, label, a, offset_s, min_ask, max_ask, min_bid, min_off, max_off,
                     direction, swing, btc_median, target_val, min_target_dist,
+                    max_target_dist,
                 );
             }
         }
@@ -709,6 +725,7 @@ struct Args {
     max_ask: Decimal,
     min_bid: Decimal,
     min_target_dist: Decimal,
+    max_target_dist: Decimal,
     min_offset_s: u64,
     max_offset_s: u64,
     swing_lookback_s: u64,
@@ -735,6 +752,7 @@ fn parse_args() -> Result<Args> {
         max_ask: Decimal::new(99, 2),
         min_bid: Decimal::new(50, 2),
         min_target_dist: Decimal::ZERO,
+        max_target_dist: Decimal::MAX,
         min_offset_s: 240,
         max_offset_s: WINDOW_SECS - 10,
         swing_lookback_s: 10,
@@ -761,6 +779,11 @@ fn parse_args() -> Result<Args> {
                 let v = args.next().context("--min-target-dist needs a value")?;
                 a.min_target_dist =
                     v.parse().with_context(|| format!("parsing --min-target-dist {v}"))?;
+            }
+            "--max-target-dist" => {
+                let v = args.next().context("--max-target-dist needs a value")?;
+                a.max_target_dist =
+                    v.parse().with_context(|| format!("parsing --max-target-dist {v}"))?;
             }
             "--min-offset" => {
                 let v = args.next().context("--min-offset needs a value")?;
@@ -807,12 +830,19 @@ async fn main() -> Result<()> {
     );
     write_header(&mut out)?;
 
+    // Decimal::MAX is the "uncapped" sentinel; printing it raw would dump a
+    // 29-digit number into the banner, so render the band instead.
+    let dist_band = if args.max_target_dist == Decimal::MAX {
+        format!(">={}", args.min_target_dist)
+    } else {
+        format!(" in [{}, {}]", args.min_target_dist, args.max_target_dist)
+    };
     eprintln!(
-        "dry-trader (no orders, per-share pnl) | ask in [{}, {}] bid>={} dist>={} offset [{}, {})s swing={}s",
+        "dry-trader (no orders, per-share pnl) | ask in [{}, {}] bid>={} dist{} offset [{}, {})s swing={}s",
         args.min_ask,
         args.max_ask,
         args.min_bid,
-        args.min_target_dist,
+        dist_band,
         args.min_offset_s,
         args.max_offset_s,
         args.swing_lookback_s,
@@ -862,6 +892,7 @@ async fn main() -> Result<()> {
         max_ask: args.max_ask,
         min_bid: args.min_bid,
         min_target_dist: args.min_target_dist,
+        max_target_dist: args.max_target_dist,
         min_offset_s: args.min_offset_s,
         max_offset_s: args.max_offset_s,
         swing_lookback: Duration::from_secs(args.swing_lookback_s),
@@ -877,6 +908,15 @@ async fn main() -> Result<()> {
 
     let (resolved_tx, mut resolved_rx) = mpsc::unbounded_channel::<ResolvedWindow>();
     let mut resolver_tasks: Vec<JoinHandle<()>> = Vec::new();
+    // Windows already handed to a resolver. A failed roll_window leaves the old
+    // window's entries in place, so the retry snapshots the SAME window again;
+    // without this guard each retry spawned another resolver, and since each one
+    // polls PM for up to 20 minutes they accumulate — hundreds of live tasks,
+    // each writing its own duplicate CSV row and holding its own socket. That is
+    // what filled the trade logs and exhausted the fd limit on 2026-07-25.
+    // Unbounded by design: one u64 per 5-minute window is ~840KB/century.
+    let mut dispatched: HashSet<u64> = HashSet::new();
+    let mut rollover_backoff = ROLLOVER_RETRY_MIN;
     // Set on shutdown so patient PM polls bail out and fall back to Pyth
     // instead of blocking process exit for up to ~20 minutes each.
     let cancel = Arc::new(AtomicBool::new(false));
@@ -914,7 +954,11 @@ async fn main() -> Result<()> {
                 }
             }
             _ = tokio::time::sleep(rollover_in), if auto_roll => {
-                if let Some(old) = snapshot_window(&state) {
+                if let Some(old) = snapshot_window(&state)
+                    && dispatched.insert(old.window_start_ts)
+                {
+                    // Inside the guard: a re-dispatched window would also have
+                    // double-counted its entries in the summary.
                     state.n_entries += old.yes_entry.is_some() as u64
                         + old.no_entry.is_some() as u64;
                     let pm_c = pm.clone();
@@ -927,12 +971,17 @@ async fn main() -> Result<()> {
                 match roll_window(&mut state, &tx, &pm, &mut pm_feed, &target_tx, &mut target_fetcher).await {
                     Ok(()) => {
                         next_rollover = next_window_boundary().ok();
+                        rollover_backoff = ROLLOVER_RETRY_MIN;
                         eprintln!("rollover: now trading {}", state.pm.condition_id);
                         print_summary(&state);
                     }
                     Err(e) => {
-                        eprintln!("WARN: rollover failed: {e:#}");
-                        next_rollover = Some(Instant::now() + Duration::from_secs(2));
+                        eprintln!(
+                            "WARN: rollover failed (retry in {}s): {e:#}",
+                            rollover_backoff.as_secs()
+                        );
+                        next_rollover = Some(Instant::now() + rollover_backoff);
+                        rollover_backoff = (rollover_backoff * 2).min(ROLLOVER_RETRY_MAX);
                     }
                 }
                 while target_rx.try_recv().is_ok() {}
@@ -948,7 +997,11 @@ async fn main() -> Result<()> {
     // polls to stop so any in-flight resolvers fall straight back to Pyth
     // instead of blocking exit for up to ~20 minutes each.
     cancel.store(true, Ordering::Relaxed);
-    if let Some(old) = snapshot_window(&state) {
+    // Same guard as the rollover arm: if we're shutting down mid-retry this
+    // window may already have a resolver in flight.
+    if let Some(old) = snapshot_window(&state)
+        && dispatched.insert(old.window_start_ts)
+    {
         state.n_entries += old.yes_entry.is_some() as u64 + old.no_entry.is_some() as u64;
         let pm_c = pm.clone();
         let tx_c = resolved_tx.clone();

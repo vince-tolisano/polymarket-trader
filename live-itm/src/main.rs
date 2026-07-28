@@ -6,7 +6,7 @@
 // captured as an entry; at rollover the window is resolved via Pyth
 // BTC/USD at window_end_ts and one CSV row is written per triggered side.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufWriter, Stdout, Write, stdout};
 use std::path::PathBuf;
@@ -41,6 +41,11 @@ const BITSTAMP_PAIR: &str = "btcusd";
 const WINDOW_SECS: u64 = 300;
 const VENUES: &[CexVenue] = &[CexVenue::Coinbase, CexVenue::Kraken, CexVenue::Bitstamp];
 const MEDIAN_FRESHNESS: Duration = Duration::from_secs(5);
+// Rollover retry backoff. Short at first so a transient blip costs at most one
+// window, then doubling so a sustained outage can't spin the rollover arm — at
+// the old flat 2s a stuck rollover retried ~30x/minute for as long as it lasted.
+const ROLLOVER_RETRY_MIN: Duration = Duration::from_secs(2);
+const ROLLOVER_RETRY_MAX: Duration = Duration::from_secs(60);
 /// A trade only triggers if the side's order book moved within this window.
 /// If the previous book update was more than this ago the book has been
 /// stale — the print waking it up is unreliable, so we skip the trigger.
@@ -192,6 +197,9 @@ struct AppState {
     /// Minimum absolute BTC distance (USD) between the median and the target
     /// required to enter — filters out marginal entries sitting on the strike.
     min_target_dist: Decimal,
+    /// Maximum absolute BTC distance (USD) allowed to enter. Decimal::MAX
+    /// means uncapped; set it to run the near-strike inverse experiment.
+    max_target_dist: Decimal,
     min_offset_s: u64,
     max_offset_s: u64,
     swing_lookback: Duration,
@@ -316,6 +324,7 @@ impl AppState {
         let btc_median = self.btc_median_last();
         let target_val = self.btc_target.map(|t| t.value);
         let min_target_dist = self.min_target_dist;
+        let max_target_dist = self.max_target_dist;
         let direction: Option<&'static str> = match (self.btc_target, btc_median) {
             (Some(t), Some(m)) if m > t.value => Some("YES"),
             (Some(t), Some(m)) if m < t.value => Some("NO "),
@@ -341,7 +350,7 @@ impl AppState {
                         row.push_ask_sample(now, ask);
                         let swing = row.ask_move_over(swing_lookback);
                         if !window_locked && book_fresh {
-                            try_trigger(row, ask, offset_s, min_ask, max_ask, min_bid, min_off, max_off, direction, swing, btc_median, target_val, min_target_dist, window_ts);
+                            try_trigger(row, ask, offset_s, min_ask, max_ask, min_bid, min_off, max_off, direction, swing, btc_median, target_val, min_target_dist, max_target_dist, window_ts);
                         }
                     }
                 }
@@ -358,7 +367,7 @@ impl AppState {
                             row.push_ask_sample(now, ba);
                             let swing = row.ask_move_over(swing_lookback);
                             if !window_locked && book_fresh {
-                                try_trigger(row, ba, offset_s, min_ask, max_ask, min_bid, min_off, max_off, direction, swing, btc_median, target_val, min_target_dist, window_ts);
+                                try_trigger(row, ba, offset_s, min_ask, max_ask, min_bid, min_off, max_off, direction, swing, btc_median, target_val, min_target_dist, max_target_dist, window_ts);
                             }
                         }
                         row.last_book_at = Some(now);
@@ -451,6 +460,7 @@ fn try_trigger(
     btc_median: Option<Decimal>,
     target: Option<Decimal>,
     min_target_dist: Decimal,
+    max_target_dist: Decimal,
     _window_ts: u64,
 ) {
     if row.entry.is_some() {
@@ -480,11 +490,16 @@ fn try_trigger(
     if direction != Some(row.side) {
         return;
     }
-    // Minimum distance past the strike: BTC must be at least `min_target_dist`
-    // (USD) away from the target, filtering out marginal entries sitting right
-    // on the strike where a tiny reversal flips the outcome.
+    // Distance past the strike, as a band [min_target_dist, max_target_dist]
+    // in USD. The floor filters out marginal entries sitting right on the
+    // strike where a tiny reversal flips the outcome. The ceiling is the
+    // INVERSE experiment: out-of-sample data through 2026-07-27 shows edge
+    // falling as distance grows (the ask more than prices the distance in),
+    // so capping it isolates the near-strike entries the floor throws away.
+    // Default ceiling is Decimal::MAX, i.e. no cap — set it explicitly.
     match (btc_median, target) {
-        (Some(m), Some(t)) if (m - t).abs() >= min_target_dist => {}
+        (Some(m), Some(t))
+            if (m - t).abs() >= min_target_dist && (m - t).abs() <= max_target_dist => {}
         _ => return,
     }
     row.entry = Some(Entry {
@@ -917,6 +932,7 @@ async fn main() -> Result<()> {
     let mut max_ask = Decimal::new(99, 2);
     let mut min_bid = Decimal::new(50, 2);
     let mut min_target_dist = Decimal::from(35);
+    let mut max_target_dist = Decimal::MAX;
     let mut min_offset_s: u64 = 240;
     let mut max_offset_s: u64 = WINDOW_SECS - 10;
     let mut swing_lookback_s: u64 = 10;
@@ -944,6 +960,12 @@ async fn main() -> Result<()> {
                 min_target_dist = v
                     .parse()
                     .with_context(|| format!("parsing --min-target-dist {v}"))?;
+            }
+            "--max-target-dist" => {
+                let v = args.next().context("--max-target-dist needs a value")?;
+                max_target_dist = v
+                    .parse()
+                    .with_context(|| format!("parsing --max-target-dist {v}"))?;
             }
             "--min-offset" => {
                 let v = args.next().context("--min-offset needs a value")?;
@@ -1019,6 +1041,7 @@ async fn main() -> Result<()> {
         max_ask,
         min_bid,
         min_target_dist,
+        max_target_dist,
         min_offset_s,
         max_offset_s,
         swing_lookback: Duration::from_secs(swing_lookback_s),
@@ -1046,6 +1069,14 @@ async fn main() -> Result<()> {
 
     let (resolved_tx, mut resolved_rx) = mpsc::unbounded_channel::<ResolutionUpdate>();
     let mut resolver_tasks: Vec<JoinHandle<()>> = Vec::new();
+    // Windows already handed to a resolver. A failed roll_window leaves the old
+    // window's entries in place, so the retry snapshots the SAME window again;
+    // without this guard each retry spawned another resolver, and since each one
+    // polls PM for up to 20 minutes they accumulate — hundreds of live tasks,
+    // each writing its own duplicate CSV row and holding its own socket. That is
+    // what filled the trade logs and exhausted the fd limit on 2026-07-25.
+    // Unbounded by design: one u64 per 5-minute window is ~840KB/century.
+    let mut dispatched: HashSet<u64> = HashSet::new();
     let cancel = Arc::new(AtomicBool::new(false));
 
     let mut terminal = init_terminal()?;
@@ -1063,6 +1094,7 @@ async fn main() -> Result<()> {
         &mut resolved_rx,
         &resolved_tx,
         &mut resolver_tasks,
+        &mut dispatched,
         Arc::clone(&cancel),
         auto_roll,
     )
@@ -1073,7 +1105,11 @@ async fn main() -> Result<()> {
     // fallback in `Final`), then spawn a final resolver for the in-progress
     // window so its CSV row gets written.
     cancel.store(true, Ordering::Relaxed);
-    if let Some(old) = snapshot_old_window(&state) {
+    // Same guard as roll_window: if we're shutting down mid-retry this window
+    // may already have a resolver in flight.
+    if let Some(old) = snapshot_old_window(&state)
+        && dispatched.insert(old.window_start_ts)
+    {
         let pm_c = pm.clone();
         let tx_c = resolved_tx.clone();
         let cancel_c = Arc::clone(&cancel);
@@ -1101,9 +1137,15 @@ async fn roll_window(
     target_fetcher: &mut Option<JoinHandle<()>>,
     resolved_tx: &mpsc::UnboundedSender<ResolutionUpdate>,
     resolver_tasks: &mut Vec<JoinHandle<()>>,
+    dispatched: &mut HashSet<u64>,
     cancel: &Arc<AtomicBool>,
 ) -> Result<()> {
-    if let Some(old) = snapshot_old_window(state) {
+    // Everything below this point is fallible, and a failure leaves the old
+    // window in place for the caller's retry to snapshot again — so dispatch
+    // has to be idempotent per window, not merely once per roll_window call.
+    if let Some(old) = snapshot_old_window(state)
+        && dispatched.insert(old.window_start_ts)
+    {
         let pm_c = pm.clone();
         let tx_c = resolved_tx.clone();
         let cancel_c = Arc::clone(cancel);
@@ -1155,6 +1197,7 @@ async fn run(
     resolved_rx: &mut mpsc::UnboundedReceiver<ResolutionUpdate>,
     resolved_tx: &mpsc::UnboundedSender<ResolutionUpdate>,
     resolver_tasks: &mut Vec<JoinHandle<()>>,
+    dispatched: &mut HashSet<u64>,
     cancel: Arc<AtomicBool>,
     auto_roll: bool,
 ) -> Result<()> {
@@ -1167,6 +1210,7 @@ async fn run(
     } else {
         None
     };
+    let mut rollover_backoff = ROLLOVER_RETRY_MIN;
 
     loop {
         terminal.draw(|f| render(f, state))?;
@@ -1207,14 +1251,19 @@ async fn run(
             _ = tokio::time::sleep(rollover_in), if auto_roll => {
                 match roll_window(
                     state, tx, pm, pm_feed, target_tx, target_fetcher,
-                    resolved_tx, resolver_tasks, &cancel,
+                    resolved_tx, resolver_tasks, dispatched, &cancel,
                 ).await {
                     Ok(()) => {
                         next_rollover = next_window_boundary().ok();
+                        rollover_backoff = ROLLOVER_RETRY_MIN;
                     }
                     Err(e) => {
-                        state.last_error = Some(format!("rollover failed: {e:#}"));
-                        next_rollover = Some(Instant::now() + Duration::from_secs(2));
+                        state.last_error = Some(format!(
+                            "rollover failed (retry in {}s): {e:#}",
+                            rollover_backoff.as_secs()
+                        ));
+                        next_rollover = Some(Instant::now() + rollover_backoff);
+                        rollover_backoff = (rollover_backoff * 2).min(ROLLOVER_RETRY_MAX);
                     }
                 }
                 while target_rx.try_recv().is_ok() {}

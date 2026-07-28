@@ -31,6 +31,59 @@ services:
     stop_grace_period: 30s
     init: true
     restart: unless-stopped
+    # Headroom, not a fix: window resolvers each hold a socket while polling PM
+    # for up to 20 minutes, so a burst of pending windows is normally fine but
+    # sits close to the 1024 default. The runaway that actually exhausted this
+    # on 2026-07-25 is fixed in the rollover dispatch guard.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
+  # INVERSE experiment. Walletless (dry-trader), so nothing is ever posted.
+  #
+  # The baseline strategy buys the favored side FAR from the strike. Cleaned
+  # out-of-sample data through 2026-07-27 says edge falls as distance grows —
+  # the ask more than prices the distance in — and the only positive slice is
+  # dist < 10 (+2.6pp over 190 trades, p=0.05 uncorrected, UNVALIDATED). This
+  # service caps distance instead of flooring it and changes nothing else, so
+  # its rows are directly comparable to the baseline dry-trader's.
+  #
+  # Why a separate run rather than filtering the baseline afterwards: the
+  # trigger takes the FIRST qualifying tick and then locks the window. With no
+  # cap, a window that starts far from the strike triggers early and locks, so
+  # near-strike entries are only recorded when the window happened to be near
+  # the strike at trigger time. Capping distance lets those windows stay open
+  # and capture entries the baseline structurally cannot see.
+  #
+  #   docker compose --profile inverse up -d
+  #
+  # Mounted at the container's default dry-data/ so the binary keeps its own
+  # timestamped filenames; only the host directory differs, which keeps these
+  # CSVs from mixing with the baseline run's.
+  dry-inverse:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: polymarket-live-trader
+    profiles: ["inverse"]
+    entrypoint: ["/usr/local/bin/dry-trader"]
+    environment:
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ./inverse-data:/app/dry-data
+    # Ask band left at the dry default (0.94, 0.99] on purpose: the distance
+    # cap already selects low asks (the market is least certain near the
+    # strike), so leaving the band wide keeps ask and distance separable in
+    # analysis instead of confounding them up front.
+    command: ["--max-target-dist", "10"]
+    stop_grace_period: 30s
+    init: true
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
 
   # REAL orders. Gated behind the "live" profile so `docker compose up` can
   # never start it by accident; opt in with --profile live or `compose run`.
@@ -68,3 +121,8 @@ services:
     stop_grace_period: 30s
     init: true
     restart: unless-stopped
+    # See the dry-trader note: headroom for concurrent window resolvers.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
