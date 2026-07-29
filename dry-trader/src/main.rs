@@ -137,6 +137,12 @@ struct State {
     min_ask: Decimal,
     max_ask: Decimal,
     min_bid: Decimal,
+    /// Buy the side the BTC median does NOT favor instead of the one it does —
+    /// the cheap longshot (e.g. YES at 0.03 while the median says NO), betting
+    /// the price crosses back before resolution. Pair it with a LOW ask band
+    /// and a low `min_bid`; the baseline's (0.94, 0.99] band can never fill on
+    /// the unfavored side.
+    invert_direction: bool,
     /// Minimum absolute BTC distance (USD) between the median and the target
     /// required to enter — filters out marginal entries sitting on the strike.
     min_target_dist: Decimal,
@@ -219,6 +225,7 @@ fn try_trigger(
     min_offset_s: u64,
     max_offset_s: u64,
     direction: Option<&'static str>,
+    invert_direction: bool,
     swing: Option<Decimal>,
     btc_median: Option<Decimal>,
     target: Option<Decimal>,
@@ -242,7 +249,14 @@ fn try_trigger(
     if bid < min_bid {
         return;
     }
-    if direction != Some(side_label) {
+    // Direction gate. Normally we enter the side the median favors. Inverted,
+    // we enter the side it does NOT favor — the cheap longshot — so the test
+    // is `== favored -> skip`. Unknown direction skips either way: there is
+    // nothing to take the opposite of.
+    let Some(favored) = direction else {
+        return;
+    };
+    if (side_label == favored) == invert_direction {
         return;
     }
     // Distance past the strike, as a band [min_target_dist, max_target_dist]
@@ -273,6 +287,7 @@ fn apply_pm(state: &mut State, e: &PolymarketEvent) {
     let min_ask = state.min_ask;
     let max_ask = state.max_ask;
     let min_bid = state.min_bid;
+    let invert_direction = state.invert_direction;
     let min_off = state.min_offset_s;
     let max_off = state.max_offset_s;
     let swing_lookback = state.swing_lookback;
@@ -302,8 +317,8 @@ fn apply_pm(state: &mut State, e: &PolymarketEvent) {
             } else {
                 try_trigger(
                     side, label, a, offset_s, min_ask, max_ask, min_bid, min_off, max_off,
-                    direction, swing, btc_median, target_val, min_target_dist,
-                    max_target_dist,
+                    direction, invert_direction, swing, btc_median, target_val,
+                    min_target_dist, max_target_dist,
                 );
             }
         }
@@ -728,6 +743,7 @@ struct Args {
     min_ask: Decimal,
     max_ask: Decimal,
     min_bid: Decimal,
+    invert_direction: bool,
     min_target_dist: Decimal,
     max_target_dist: Decimal,
     min_offset_s: u64,
@@ -756,6 +772,7 @@ fn parse_args() -> Result<Args> {
         min_ask: Decimal::new(94, 2),
         max_ask: Decimal::new(99, 2),
         min_bid: Decimal::new(50, 2),
+        invert_direction: false,
         min_target_dist: Decimal::ZERO,
         max_target_dist: Decimal::MAX,
         min_offset_s: 240,
@@ -768,6 +785,7 @@ fn parse_args() -> Result<Args> {
             "-o" | "--out" => {
                 a.out_path = Some(PathBuf::from(args.next().context("--out needs a path")?))
             }
+            "--invert-direction" => a.invert_direction = true,
             "--out-prefix" => {
                 let v = args.next().context("--out-prefix needs a value")?;
                 // A prefix is a filename stem, not a path — a separator here
@@ -851,8 +869,16 @@ async fn main() -> Result<()> {
     } else {
         format!(" in [{}, {}]", args.min_target_dist, args.max_target_dist)
     };
+    // Which side the direction gate takes. INVERTED is the longshot mode and
+    // is easy to leave on by accident, so it goes in the banner, not a debug log.
+    let side_mode = if args.invert_direction {
+        "INVERTED (buy the UNFAVORED side)"
+    } else {
+        "favored side"
+    };
     eprintln!(
-        "dry-trader (no orders, per-share pnl) | ask in [{}, {}] bid>={} dist{} offset [{}, {})s swing={}s",
+        "dry-trader (no orders, per-share pnl) | {} | ask in ({}, {}] bid>={} dist{} offset [{}, {})s swing={}s",
+        side_mode,
         args.min_ask,
         args.max_ask,
         args.min_bid,
@@ -905,6 +931,7 @@ async fn main() -> Result<()> {
         min_ask: args.min_ask,
         max_ask: args.max_ask,
         min_bid: args.min_bid,
+        invert_direction: args.invert_direction,
         min_target_dist: args.min_target_dist,
         max_target_dist: args.max_target_dist,
         min_offset_s: args.min_offset_s,

@@ -194,6 +194,12 @@ struct AppState {
     min_ask: Decimal,
     max_ask: Decimal,
     min_bid: Decimal,
+    /// Buy the side the BTC median does NOT favor instead of the one it does —
+    /// the cheap longshot (e.g. YES at 0.03 while the median says NO), betting
+    /// the price crosses back before resolution. Pair it with a LOW ask band
+    /// and a low `min_bid`; the baseline's (0.95, 0.99] band can never fill on
+    /// the unfavored side.
+    invert_direction: bool,
     /// Minimum absolute BTC distance (USD) between the median and the target
     /// required to enter — filters out marginal entries sitting on the strike.
     min_target_dist: Decimal,
@@ -315,6 +321,7 @@ impl AppState {
         let min_ask = self.min_ask;
         let max_ask = self.max_ask;
         let min_bid = self.min_bid;
+        let invert_direction = self.invert_direction;
         let min_off = self.min_offset_s;
         let max_off = self.max_offset_s;
         let window_ts = self.window_start_ts;
@@ -350,7 +357,7 @@ impl AppState {
                         row.push_ask_sample(now, ask);
                         let swing = row.ask_move_over(swing_lookback);
                         if !window_locked && book_fresh {
-                            try_trigger(row, ask, offset_s, min_ask, max_ask, min_bid, min_off, max_off, direction, swing, btc_median, target_val, min_target_dist, max_target_dist, window_ts);
+                            try_trigger(row, ask, offset_s, min_ask, max_ask, min_bid, min_off, max_off, direction, invert_direction, swing, btc_median, target_val, min_target_dist, max_target_dist, window_ts);
                         }
                     }
                 }
@@ -367,7 +374,7 @@ impl AppState {
                             row.push_ask_sample(now, ba);
                             let swing = row.ask_move_over(swing_lookback);
                             if !window_locked && book_fresh {
-                                try_trigger(row, ba, offset_s, min_ask, max_ask, min_bid, min_off, max_off, direction, swing, btc_median, target_val, min_target_dist, max_target_dist, window_ts);
+                                try_trigger(row, ba, offset_s, min_ask, max_ask, min_bid, min_off, max_off, direction, invert_direction, swing, btc_median, target_val, min_target_dist, max_target_dist, window_ts);
                             }
                         }
                         row.last_book_at = Some(now);
@@ -456,6 +463,7 @@ fn try_trigger(
     min_offset_s: u64,
     max_offset_s: u64,
     direction: Option<&'static str>,
+    invert_direction: bool,
     swing: Option<Decimal>,
     btc_median: Option<Decimal>,
     target: Option<Decimal>,
@@ -486,8 +494,13 @@ fn try_trigger(
     }
     // Direction confirmation: only enter the side BTC is currently showing
     // (median > target → YES, median < target → NO). If direction is
-    // unknown (no target or median yet) we skip rather than guess.
-    if direction != Some(row.side) {
+    // unknown (no target or median yet) we skip rather than guess. Inverted,
+    // we take the side it does NOT favor — the cheap longshot — so the test
+    // flips to `== favored -> skip`.
+    let Some(favored) = direction else {
+        return;
+    };
+    if (row.side == favored) == invert_direction {
         return;
     }
     // Distance past the strike, as a band [min_target_dist, max_target_dist]
@@ -931,6 +944,7 @@ async fn main() -> Result<()> {
     let mut min_ask = Decimal::new(95, 2);
     let mut max_ask = Decimal::new(99, 2);
     let mut min_bid = Decimal::new(50, 2);
+    let mut invert_direction = false;
     let mut min_target_dist = Decimal::from(35);
     let mut max_target_dist = Decimal::MAX;
     let mut min_offset_s: u64 = 240;
@@ -955,6 +969,7 @@ async fn main() -> Result<()> {
                 let v = args.next().context("--min-bid needs a value")?;
                 min_bid = v.parse().with_context(|| format!("parsing --min-bid {v}"))?;
             }
+            "--invert-direction" => invert_direction = true,
             "--min-target-dist" => {
                 let v = args.next().context("--min-target-dist needs a value")?;
                 min_target_dist = v
@@ -1040,6 +1055,7 @@ async fn main() -> Result<()> {
         min_ask,
         max_ask,
         min_bid,
+        invert_direction,
         min_target_dist,
         max_target_dist,
         min_offset_s,
@@ -1454,8 +1470,9 @@ fn strategy_panel(state: &AppState) -> Paragraph<'_> {
             Line::from(vec![
                 Span::styled("Band:      ", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw(format!(
-                    "ask in [{}, {}], bid ≥ {}, dir matches BTC   eligible offset [{}, {})s",
+                    "ask in ({}, {}], bid ≥ {}, dir {} BTC   eligible offset [{}, {})s",
                     state.min_ask, state.max_ask, state.min_bid,
+                    if state.invert_direction { "OPPOSES" } else { "matches" },
                     state.min_offset_s, state.max_offset_s
                 )),
             ]),
@@ -1504,8 +1521,9 @@ fn strategy_panel(state: &AppState) -> Paragraph<'_> {
         Line::from(vec![
             Span::styled("Band:      ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(format!(
-                "ask in [{}, {}], bid ≥ {}, dir matches BTC   ",
-                state.min_ask, state.max_ask, state.min_bid
+                "ask in ({}, {}], bid ≥ {}, dir {} BTC   ",
+                state.min_ask, state.max_ask, state.min_bid,
+                if state.invert_direction { "OPPOSES" } else { "matches" }
             )),
             Span::styled(
                 format!("[{status_text}]"),

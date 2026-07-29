@@ -42,19 +42,29 @@ services:
 
   # INVERSE experiment. Walletless (dry-trader), so nothing is ever posted.
   #
-  # The baseline strategy buys the favored side FAR from the strike. Cleaned
-  # out-of-sample data through 2026-07-27 says edge falls as distance grows —
-  # the ask more than prices the distance in — and the only positive slice is
-  # dist < 10 (+2.6pp over 190 trades, p=0.05 uncorrected, UNVALIDATED). This
-  # service caps distance instead of flooring it and changes nothing else, so
-  # its rows are directly comparable to the baseline dry-trader's.
+  # Takes the OTHER SIDE of the baseline trade. Baseline buys the side the BTC
+  # median favors at a rich ask (0.94–0.99) and collects a few cents when the
+  # price doesn't cross back. This buys the side the median does NOT favor at a
+  # cheap ask (~0.01–0.06) and collects ~0.95 when it DOES cross back. Same
+  # windows, opposite bet.
   #
-  # Why a separate run rather than filtering the baseline afterwards: the
-  # trigger takes the FIRST qualifying tick and then locks the window. With no
-  # cap, a window that starts far from the strike triggers early and locks, so
-  # near-strike entries are only recorded when the window happened to be near
-  # the strike at trigger time. Capping distance lets those windows stay open
-  # and capture entries the baseline structurally cannot see.
+  # Why: cleaned out-of-sample data through 2026-07-27 says edge falls as
+  # distance from the strike grows — the favored side is priced too rich when
+  # BTC is far out. If that's real, its mirror is that the cheap side is priced
+  # too thin, and a longshot at 0.03 only needs a 3% cross-back rate to break
+  # even.
+  #
+  # Every gate below has to move together; two of them make the trade
+  # impossible on their own:
+  #   --invert-direction  take the side the median opposes (the trade itself)
+  #   --min-ask/--max-ask band (0, 0.06] — the baseline's 0.94–0.99 band can
+  #                       never match an unfavored side, so leaving it alone
+  #                       means zero entries, not a longshot
+  #   --min-bid 0.01      the 0.50 default is above the entire longshot price
+  #                       range and would reject every single tick
+  #   (no --max-target-dist) — the near-strike cap contradicts this: a 3-cent
+  #                       side only exists when BTC is FAR from the strike.
+  #                       Near the strike both sides price near 0.50.
   #
   #   docker compose --profile inverse up -d
   #
@@ -74,16 +84,22 @@ services:
       TZ: ${TZ:-UTC}
     volumes:
       - ./dry-data:/app/dry-data
-    # Ask band left at the dry default (0.94, 0.99] on purpose: the distance
-    # cap already selects low asks (the market is least certain near the
-    # strike), so leaving the band wide keeps ask and distance separable in
-    # analysis instead of confounding them up front.
-    # --max-offset 300 (vs the 290 default) opens the final 10 seconds of the
-    # window; the gate is exclusive (offset >= max is rejected), so this admits
-    # offsets 290–299. Near-strike entries are exactly the ones that resolve
-    # late, so the last 10s is where this experiment expects its signal.
+    # --max-offset 300 (vs the 290 default) opens the final 10 seconds; the
+    # gate is exclusive (offset >= max is rejected), so this admits offsets
+    # 290–299. Note this cuts BOTH ways for a longshot: the cheapest asks are
+    # in the last seconds, but a cross-back also has the least time to happen.
     command:
-      ["--max-target-dist", "10", "--max-offset", "300", "--out-prefix", "inverse-trade"]
+      - "--invert-direction"
+      - "--min-ask"
+      - "0"
+      - "--max-ask"
+      - "0.06"
+      - "--min-bid"
+      - "0.01"
+      - "--max-offset"
+      - "300"
+      - "--out-prefix"
+      - "inverse-trade"
     stop_grace_period: 30s
     init: true
     restart: unless-stopped
