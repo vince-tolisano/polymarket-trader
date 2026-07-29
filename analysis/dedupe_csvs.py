@@ -76,7 +76,10 @@ def main(apply=False):
         if not d.exists():
             continue
         print(f"=== {d.name} ===")
-        for f in sorted(d.glob("trade*.csv")):
+        # "*trade*" not "trade*": prefixed dry runs (dry-trader --out-prefix,
+        # e.g. inverse-trade-<stamp>.csv) share these directories and need the
+        # same duplicate-row cleaning.
+        for f in sorted(d.glob("*trade*.csv")):
             n, k = dedupe_file(f, apply=apply)
             total_rows += n
             total_kept += k

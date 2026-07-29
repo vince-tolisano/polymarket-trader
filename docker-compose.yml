@@ -58,9 +58,11 @@ services:
   #
   #   docker compose --profile inverse up -d
   #
-  # Mounted at the container's default dry-data/ so the binary keeps its own
-  # timestamped filenames; only the host directory differs, which keeps these
-  # CSVs from mixing with the baseline run's.
+  # Shares the baseline's ./dry-data mount (already writable by uid 10001) and
+  # separates itself by FILENAME instead: --out-prefix makes it write
+  # inverse-trade-<stamp>.csv, which the analysis' trade*.csv glob does not
+  # match, so the two runs never mix. Loading them is
+  # load_dry(pattern="inverse-trade*.csv").
   dry-inverse:
     build:
       context: .
@@ -71,12 +73,17 @@ services:
     environment:
       TZ: ${TZ:-UTC}
     volumes:
-      - ./inverse-data:/app/dry-data
+      - ./dry-data:/app/dry-data
     # Ask band left at the dry default (0.94, 0.99] on purpose: the distance
     # cap already selects low asks (the market is least certain near the
     # strike), so leaving the band wide keeps ask and distance separable in
     # analysis instead of confounding them up front.
-    command: ["--max-target-dist", "10"]
+    # --max-offset 300 (vs the 290 default) opens the final 10 seconds of the
+    # window; the gate is exclusive (offset >= max is rejected), so this admits
+    # offsets 290–299. Near-strike entries are exactly the ones that resolve
+    # late, so the last 10s is where this experiment expects its signal.
+    command:
+      ["--max-target-dist", "10", "--max-offset", "300", "--out-prefix", "inverse-trade"]
     stop_grace_period: 30s
     init: true
     restart: unless-stopped

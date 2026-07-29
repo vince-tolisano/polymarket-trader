@@ -720,6 +720,10 @@ fn print_summary(state: &State) {
 
 struct Args {
     out_path: Option<PathBuf>,
+    /// Filename stem prefix for the auto-named CSV: `dry-data/<prefix>-<stamp>.csv`.
+    /// Lets a second dry run (e.g. the inverse experiment) share the dry-data
+    /// mount without its rows mixing into the baseline's `trade-*.csv` glob.
+    out_prefix: String,
     explicit_market: Option<String>,
     min_ask: Decimal,
     max_ask: Decimal,
@@ -747,6 +751,7 @@ fn parse_args() -> Result<Args> {
     //    was plausible.
     let mut a = Args {
         out_path: None,
+        out_prefix: "trade".to_string(),
         explicit_market: None,
         min_ask: Decimal::new(94, 2),
         max_ask: Decimal::new(99, 2),
@@ -762,6 +767,15 @@ fn parse_args() -> Result<Args> {
         match arg.as_str() {
             "-o" | "--out" => {
                 a.out_path = Some(PathBuf::from(args.next().context("--out needs a path")?))
+            }
+            "--out-prefix" => {
+                let v = args.next().context("--out-prefix needs a value")?;
+                // A prefix is a filename stem, not a path — a separator here
+                // would silently write outside the mounted dry-data dir.
+                if v.is_empty() || v.contains('/') || v.contains('\\') {
+                    anyhow::bail!("--out-prefix must be a non-empty filename stem: {v}");
+                }
+                a.out_prefix = v;
             }
             "--min-ask" => {
                 let v = args.next().context("--min-ask needs a value")?;
@@ -819,7 +833,7 @@ async fn main() -> Result<()> {
 
     let out_path = args.out_path.clone().unwrap_or_else(|| {
         let stamp = chrono::Local::now().format("%m-%d-%Y-%H.%M");
-        PathBuf::from(format!("dry-data/trade-{stamp}.csv"))
+        PathBuf::from(format!("dry-data/{}-{stamp}.csv", args.out_prefix))
     });
     if let Some(parent) = out_path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)

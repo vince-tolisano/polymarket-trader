@@ -46,7 +46,7 @@ SEED = 0
 
 
 def load_oos(dry=False, cutoff=DEFAULT_CUTOFF, drop_unresolved=True, path=None,
-             dedupe=True):
+             dedupe=True, pattern=None):
     """Load trades, keeping only runs that started at/after `cutoff`.
 
     Filters on run_start (from the filename), not window_time, so a run is
@@ -68,11 +68,19 @@ def load_oos(dry=False, cutoff=DEFAULT_CUTOFF, drop_unresolved=True, path=None,
     win rate. Kept here as a safety net for freshly-pulled EC2 files: the
     on-disk CSVs were cleaned on 2026-07-27, so this is normally a no-op.
     Pass dedupe=False to inspect the raw rows.
+
+    `pattern` (dry only) selects a filename glob within the directory, for dry
+    runs that share dry-data but write a prefixed name — the inverse
+    experiment is `pattern="inverse-trade*.csv"`. Default keeps load_dry's
+    baseline `trade*.csv`.
     """
-    if path:
-        df = load_dry(path) if dry else load_trades(path)
+    if dry:
+        kw = {"pattern": pattern} if pattern else {}
+        df = load_dry(path, **kw) if path else load_dry(**kw)
+    elif path:
+        df = load_trades(path)
     else:
-        df = load_dry() if dry else load_trades()
+        df = load_trades()
 
     if dedupe:
         key = ["window_start_ts", "side"]

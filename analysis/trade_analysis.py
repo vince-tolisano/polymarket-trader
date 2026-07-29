@@ -20,6 +20,7 @@ Usage from a notebook:
     print_feature_scan(df)
 """
 
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -28,6 +29,18 @@ import numpy as np
 import pandas as pd
 
 HERE = Path(__file__).parent
+
+# Trailing run stamp in a CSV filename: <anything>-MM-DD-YYYY-HH.MM.csv. Matched
+# from the end rather than stripping a fixed "trade-" prefix, so prefixed runs
+# (dry-trader --out-prefix, e.g. inverse-trade-...) parse the same way.
+_STAMP_RE = re.compile(r"(\d{2}-\d{2}-\d{4}-\d{2}\.\d{2})$")
+
+
+def _run_start_from_name(f):
+    m = _STAMP_RE.search(f.stem)
+    if not m:
+        raise ValueError(f"no run stamp in filename: {f.name}")
+    return datetime.strptime(m.group(1), "%m-%d-%Y-%H.%M")
 
 
 def load_trades(path=HERE / "live-data", header=HERE / "header.csv", drop_errors=True):
@@ -46,7 +59,7 @@ def load_trades(path=HERE / "live-data", header=HERE / "header.csv", drop_errors
     for f in sorted(Path(path).glob("trade*.csv")):
         d = pd.read_csv(f, skiprows=1, header=None, names=cols)
         d["source_file"] = f.name
-        d["run_start"] = datetime.strptime(f.stem.removeprefix("trade-"), "%m-%d-%Y-%H.%M")
+        d["run_start"] = _run_start_from_name(f)
         frames.append(d)
     df = pd.concat(frames, ignore_index=True)
 
@@ -68,7 +81,7 @@ def load_trades(path=HERE / "live-data", header=HERE / "header.csv", drop_errors
     return df.sort_values("window_start_ts").reset_index(drop=True)
 
 
-def load_dry(path=HERE / "dry-data", drop_unresolved=True):
+def load_dry(path=HERE / "dry-data", drop_unresolved=True, pattern="trade*.csv"):
     """Load dry-trader CSVs (live-itm schema: per-share pnl, no sizing).
 
     Columns are renamed/derived to line up with load_trades() output so
@@ -76,15 +89,21 @@ def load_dry(path=HERE / "dry-data", drop_unresolved=True):
     entry_ask -> intended_ask, entry_offset_s -> entry_offset_s, and
     pnl_per_dollar = pnl / ask (a share risks its ask price). These files
     carry their own header row, so no header.csv is involved.
+
+    `pattern` selects which run's files to load out of a shared directory —
+    the baseline dry-trader writes trade-<stamp>.csv, and a second dry run
+    started with --out-prefix writes <prefix>-<stamp>.csv alongside it. The
+    default glob deliberately does NOT match a prefixed name, so the baseline
+    stays clean; pass pattern="inverse-trade*.csv" to load the experiment.
     """
     frames = []
-    for f in sorted(Path(path).glob("trade*.csv")):
+    for f in sorted(Path(path).glob(pattern)):
         d = pd.read_csv(f)
         d["source_file"] = f.name
-        d["run_start"] = datetime.strptime(f.stem.removeprefix("trade-"), "%m-%d-%Y-%H.%M")
+        d["run_start"] = _run_start_from_name(f)
         frames.append(d)
     if not frames:
-        raise FileNotFoundError(f"no trade*.csv files in {path}")
+        raise FileNotFoundError(f"no {pattern} files in {path}")
     df = pd.concat(frames, ignore_index=True)
 
     n_unresolved = df.won.isna().sum()
