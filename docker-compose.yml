@@ -3,6 +3,8 @@
 #   Build:        docker compose build
 #   Dry (safe):   docker compose up                 (starts dry-trader only —
 #                                                    no wallet, nothing posted)
+#   Book data:    docker compose --profile features up -d   (dry + recorder;
+#                                                    walletless, no position)
 #   GO LIVE:      docker compose --profile live up -d      (dry + live), or
 #                 docker compose run --rm live-trader <flags>  (live one-off)
 #
@@ -103,6 +105,63 @@ services:
     stop_grace_period: 30s
     init: true
     restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
+  # ORDER-BOOK RECORDER. Takes no position and posts nothing — it is not a
+  # trader at all, it only samples the market. Walletless.
+  #
+  # Why this exists: every trade CSV (live, dry, inverse) records exactly ONE
+  # price — the ask that was paid. That is enough to measure a taker's edge and
+  # nothing else, which is why ~5.9k logged trades can only answer the one
+  # question they already answered (edge ≈ −half the spread, signal ≈ 0). This
+  # binary is the only thing in the workspace that captures the OTHER side of
+  # the book plus resting sizes:
+  #
+  #   yes_bid/yes_bid_size/yes_ask/yes_ask_size/yes_last  (and the NO mirror)
+  #   book_tightness = 1 − (yes_bid + no_bid)   <-- the BID-side gap
+  #
+  # Note book_tightness is the bid-side complement of the ask-side overround
+  # (yes_ask + no_ask − 1 ≈ 1.09pp) that the trade CSVs imply. Together the two
+  # bracket the entire region a MAKER could quote into, which no existing
+  # dataset covers. It also logs won / pnl_if_entered per sampled tick, so
+  # adverse selection (do resting orders only fill when the move is about to go
+  # against you?) is measurable from this file alone.
+  #
+  #   docker compose --profile features up -d
+  #
+  # working_dir instead of --out: the binary's --out takes a fixed path and
+  # File::create TRUNCATES, so with restart: unless-stopped a container restart
+  # would silently wipe the file. Given no --out it falls back to
+  # features-<unix_ts>.csv in the CWD, so pointing CWD at the mount gives one
+  # fresh timestamped file per start and never clobbers a previous run.
+  feature-recorder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: polymarket-live-trader
+    profiles: ["features"]
+    entrypoint: ["/usr/local/bin/feature-recorder"]
+    working_dir: /app/feature-data
+    environment:
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ./feature-data:/app/feature-data
+    # --min-offset 120 samples the last 3 minutes of each window at 1s ticks
+    # (the 180 default gives only 2). The extra minute is deliberate: a maker
+    # rests an order BEFORE the 240–260s region where entries actually trigger,
+    # so measuring adverse selection needs book history from before the fill,
+    # not just at it. Costs ~2 rows/sec/window of CSV.
+    command: ["--min-offset", "120"]
+    # Same graceful-shutdown contract as the traders: SIGINT (set via the
+    # image's STOPSIGNAL) drains in-flight window resolutions and flushes the
+    # CSV. Without the grace period the last window's rows are lost.
+    stop_grace_period: 30s
+    init: true
+    restart: unless-stopped
+    # See the dry-trader note: headroom for concurrent window resolvers.
     ulimits:
       nofile:
         soft: 65536
