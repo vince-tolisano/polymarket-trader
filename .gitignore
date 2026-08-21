@@ -26,3 +26,16 @@ test-geo
 .env
 .env.*
 !.env.example
+
+# Runtime bind-mount data dirs (docker-compose writes these as the container
+# user). feature-recorder CSVs in particular run to 50-130 MB per run, which
+# GitHub hard-rejects above 100 MB — one of them blocked a push on 2026-08-20.
+# Root-anchored on purpose: analysis/dry-data and analysis/live-data are the
+# curated copies and ARE tracked.
+/data/
+/dry-data/
+/feature-data/
+
+# Python bytecode (analysis/__pycache__ was tracked and churns on every run)
+__pycache__/
+*.py[cod]

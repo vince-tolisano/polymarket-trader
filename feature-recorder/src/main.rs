@@ -1,8 +1,16 @@
 // feature-recorder: samples one row per second per side during the late part
 // of each 5-min btc-updown-5m window, capturing decision-time features that
 // a model can use to predict whether entering at that moment would have won.
-// Buffers rows in-memory per window until the Pyth resolution lands, then
-// writes labeled rows (won, pnl_if_entered) to CSV.
+// Buffers rows in-memory per window until resolution lands, then writes
+// labeled rows (won, pnl_if_entered, resolved_source) to CSV.
+//
+// RESOLUTION (KEEP IN SYNC with live-trader/dry-trader/live-itm): the on-chain
+// CLOB winner is authoritative and Pyth target-vs-final is only the FALLBACK.
+// This binary used to resolve from Pyth alone; on 2026-08-12..20 data that
+// mislabeled ~8.4% of windows (a market at >=99% confidence one second before
+// expiry agreed with the Pyth label only 91.6% of the time), which biased every
+// win-rate/edge figure computed from the file. Do not "simplify" this back to
+// Pyth-only.
 //
 // No strategy logic — the row is a hypothetical entry at that moment on that
 // side. The model fits "given features at time t, P(side wins)".
@@ -12,6 +20,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
@@ -71,6 +80,9 @@ struct PendingWindow {
     window_start_ts: u64,
     condition_id: String,
     target: Option<Decimal>,
+    /// Needed to map the on-chain winning token back to a side.
+    yes_token: U256,
+    no_token: Option<U256>,
     rows: Vec<FeatureRow>,
 }
 
@@ -79,6 +91,8 @@ struct ResolvedWindow {
     condition_id: String,
     target: Option<Decimal>,
     final_pyth: Option<Decimal>,
+    /// On-chain winner side if PM resolved it; else None and we fall back to Pyth.
+    pm_winner_side: Option<&'static str>,
     rows: Vec<FeatureRow>,
 }
 
@@ -339,7 +353,7 @@ fn write_header(w: &mut BufWriter<File>) -> Result<()> {
          no_bid,no_bid_size,no_ask,no_ask_size,no_last,\
          book_tightness,\
          btc_median,btc_target,btc_delta,btc_slope_30s,btc_vol_30s,n_cex_trades_30s,\
-         final_pyth,resolved_side,won,pnl_if_entered"
+         final_pyth,resolved_side,resolved_source,won,pnl_if_entered"
     )?;
     w.flush()?;
     Ok(())
@@ -359,13 +373,14 @@ fn write_row(
     row: &FeatureRow,
     final_pyth: Option<Decimal>,
     resolved_side: Option<&str>,
+    resolved_source: &str,
     won: Option<bool>,
     pnl: Option<Decimal>,
 ) -> Result<()> {
     let won_s = won.map(|b| if b { "1" } else { "0" }).unwrap_or("");
     writeln!(
         w,
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         window_start_ts,
         condition_id,
         row.offset_s,
@@ -389,6 +404,7 @@ fn write_row(
         row.n_cex_trades_30s,
         opt_dec(final_pyth),
         resolved_side.unwrap_or(""),
+        resolved_source,
         won_s,
         opt_dec(pnl),
     )?;
@@ -426,18 +442,55 @@ async fn fetch_final_pyth_retry(pm: &Polymarket, window_end_ts: u64) -> Option<D
     None
 }
 
+/// Poll the CLOB market until it closes and reports a winner; match the winner
+/// token back to a side. Returns None if it never resolves within the budget,
+/// in which case the caller falls back to Pyth. Patient ~20-minute budget for
+/// the same reason as live-trader/dry-trader: PM publishes the winner minutes
+/// after the window closes, and giving up early silently downgrades the label.
+async fn poll_pm_winner(
+    pm: &Polymarket,
+    condition_id: &str,
+    yes_token: U256,
+    no_token: Option<U256>,
+    cancel: Arc<AtomicBool>,
+) -> Option<&'static str> {
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    for _ in 0..240 {
+        // On shutdown, stop the patient poll and let the caller fall back to
+        // Pyth immediately rather than blocking exit for up to ~20 minutes.
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        if let Ok(Some(token_id)) = pm.market_winner(condition_id).await {
+            if token_id == yes_token {
+                return Some("YES");
+            }
+            if no_token == Some(token_id) {
+                return Some("NO");
+            }
+            return None;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    None
+}
+
 async fn resolve_window(
     old: PendingWindow,
     pm: Arc<Polymarket>,
     tx: mpsc::UnboundedSender<ResolvedWindow>,
+    cancel: Arc<AtomicBool>,
 ) {
     let window_end_ts = old.window_start_ts + WINDOW_SECS;
     let final_pyth = fetch_final_pyth_retry(&pm, window_end_ts).await;
+    let pm_winner_side =
+        poll_pm_winner(&pm, &old.condition_id, old.yes_token, old.no_token, cancel).await;
     let _ = tx.send(ResolvedWindow {
         window_start_ts: old.window_start_ts,
         condition_id: old.condition_id,
         target: old.target,
         final_pyth,
+        pm_winner_side,
         rows: old.rows,
     });
 }
@@ -477,6 +530,8 @@ fn snapshot_pending(state: &mut State) -> Option<PendingWindow> {
         window_start_ts: state.window_start_ts,
         condition_id: state.condition_id.clone(),
         target: state.target_price,
+        yes_token: state.yes_token,
+        no_token: state.no_token,
         rows,
     })
 }
@@ -488,9 +543,15 @@ fn sink_resolved(
     n_windows_unresolved: &mut u64,
     r: ResolvedWindow,
 ) {
-    let resolved_side = match (r.target, r.final_pyth) {
-        (Some(t), Some(f)) => Some(if f > t { "YES" } else { "NO" }),
-        _ => None,
+    // Prefer the authoritative on-chain winner; fall back to Pyth
+    // target-vs-final. resolved_source is written to the CSV so the label
+    // quality is auditable after the fact rather than assumed.
+    let (resolved_side, resolved_source) = match r.pm_winner_side {
+        Some(s) => (Some(s), "pm"),
+        None => match (r.target, r.final_pyth) {
+            (Some(t), Some(f)) => (Some(if f > t { "YES" } else { "NO" }), "pyth"),
+            _ => (None, ""),
+        },
     };
     if resolved_side.is_some() {
         *n_windows_labeled += 1;
@@ -517,6 +578,7 @@ fn sink_resolved(
             row,
             r.final_pyth,
             resolved_side,
+            resolved_source,
             won,
             pnl,
         ) {
@@ -677,6 +739,10 @@ async fn main() -> Result<()> {
 
     let (resolved_tx, mut resolved_rx) = mpsc::unbounded_channel::<ResolvedWindow>();
     let mut resolver_tasks: Vec<JoinHandle<()>> = Vec::new();
+    // Set on SIGINT so in-flight winner polls stop waiting on PM (up to ~20
+    // minutes) and fall back to Pyth immediately, letting shutdown finish
+    // inside the container's stop grace period.
+    let cancel = Arc::new(AtomicBool::new(false));
 
     let mut next_rollover: Option<Instant> = if auto_roll {
         Some(next_window_boundary()?)
@@ -740,8 +806,9 @@ async fn main() -> Result<()> {
                 if let Some(pending) = snapshot_pending(&mut state) {
                     let pm_c = pm.clone();
                     let tx_c = resolved_tx.clone();
+                    let cancel_c = cancel.clone();
                     resolver_tasks.push(tokio::spawn(async move {
-                        resolve_window(pending, pm_c, tx_c).await;
+                        resolve_window(pending, pm_c, tx_c, cancel_c).await;
                     }));
                 }
                 match roll_window(
@@ -795,6 +862,10 @@ async fn main() -> Result<()> {
             }
             _ = signal::ctrl_c() => {
                 eprintln!("\nshutting down…");
+                // Stop in-flight winner polls so they fall back to Pyth immediately;
+                // otherwise shutdown blocks for up to ~20 min and the container is
+                // SIGKILLed past its grace period, losing the final window's rows.
+                cancel.store(true, Ordering::Relaxed);
                 break Ok(());
             }
         }
@@ -805,8 +876,9 @@ async fn main() -> Result<()> {
     if let Some(pending) = snapshot_pending(&mut state) {
         let pm_c = pm.clone();
         let tx_c = resolved_tx.clone();
+        let cancel_c = cancel.clone();
         resolver_tasks.push(tokio::spawn(async move {
-            resolve_window(pending, pm_c, tx_c).await;
+            resolve_window(pending, pm_c, tx_c, cancel_c).await;
         }));
     }
     drop(resolved_tx);

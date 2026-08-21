@@ -35,7 +35,8 @@
       "Bash(git ls-tree *)",
       "PowerShell($paths = @\\(\"$env:USERPROFILE\\\\.cargo\\\\bin\\\\cargo.exe\",\"$env:USERPROFILE\\\\.rustup\\\\bin\\\\cargo.exe\",\"C:\\\\ProgramData\\\\chocolatey\\\\bin\\\\cargo.exe\"\\); $paths | ForEach-Object { if \\(Test-Path $_\\) { \"FOUND $_\" } }; where.exe rustc 2>$null; where.exe cargo 2>$null)",
       "Bash(\"../.venv/Scripts/python.exe\" -)",
-      "PowerShell($paths = @\\(\"$env:USERPROFILE\\\\.cargo\\\\bin\", \"$env:USERPROFILE\\\\.rustup\", \"C:\\\\Program Files\\\\Rust\", \"$env:ProgramData\\\\chocolatey\\\\bin\"\\); foreach \\($p in $paths\\) { if \\(Test-Path $p\\) { Write-Output \"EXISTS: $p\" } }; try { Get-Command rustc -ErrorAction Stop | Select-Object Source } catch { Write-Output \"rustc not on PATH\" }; try { Get-Command rustup -ErrorAction Stop | Select-Object Source } catch { Write-Output \"rustup not on PATH\" })"
+      "PowerShell($paths = @\\(\"$env:USERPROFILE\\\\.cargo\\\\bin\", \"$env:USERPROFILE\\\\.rustup\", \"C:\\\\Program Files\\\\Rust\", \"$env:ProgramData\\\\chocolatey\\\\bin\"\\); foreach \\($p in $paths\\) { if \\(Test-Path $p\\) { Write-Output \"EXISTS: $p\" } }; try { Get-Command rustc -ErrorAction Stop | Select-Object Source } catch { Write-Output \"rustc not on PATH\" }; try { Get-Command rustup -ErrorAction Stop | Select-Object Source } catch { Write-Output \"rustup not on PATH\" })",
+      "PowerShell(& \".\\\\.venv\\\\Scripts\\\\python.exe\" \"C:\\\\Users\\\\Owner\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-Owner-PycharmProjects-polymarket-trader\\\\ae1c0cad-2fa8-4f87-af74-4f29207445b0\\\\scratchpad\\\\pair.py\")"
     ]
   }
 }
